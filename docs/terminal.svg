@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="840" height="424" viewBox="0 0 840 424" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="14">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1c2230"/>
+      <stop offset="100%" stop-color="#161b26"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="840" height="424" rx="10" fill="url(#bg)"/>
+  <path d="M0 10a10 10 0 0 1 10-10h820a10 10 0 0 1 10 10v26H0z" fill="#232b3a"/>
+  <circle cx="22" cy="18" r="6" fill="#ff5f57"/>
+  <circle cx="43" cy="18" r="6" fill="#febc2e"/>
+  <circle cx="64" cy="18" r="6" fill="#28c840"/>
+  <text x="420" y="23" fill="#7d8799" font-size="12.5" text-anchor="middle">root@gemstone — object-tracker</text>
+
+  <text x="24" y="66" xml:space="preserve"><tspan fill="#5eead4">$ </tspan><tspan fill="#e6edf3">./app_edgeai.py ../configs/tracking.yaml -n</tspan></text>
+
+  <text x="24" y="98" xml:space="preserve"><tspan fill="#7d8799">[INFO] </tspan><tspan fill="#a3b1c6">Tracking classes: </tspan><tspan fill="#fbbf77">person</tspan><tspan fill="#a3b1c6"> (model indices [0])</tspan></text>
+  <text x="24" y="118" xml:space="preserve"><tspan fill="#7d8799">[INFO] </tspan><tspan fill="#a3b1c6">Tracking mode: </tspan><tspan fill="#5eead4">lock</tspan><tspan fill="#a3b1c6"> - locks onto a single target</tspan></text>
+
+  <text x="24" y="154" xml:space="preserve"><tspan fill="#6b7688">[f:506] </tspan><tspan fill="#28c840">* </tspan><tspan fill="#a3b1c6">locked </tspan><tspan fill="#7dd3fc">id=1</tspan></text>
+
+  <text x="24" y="180" xml:space="preserve"><tspan fill="#6b7688">[f:510] </tspan><tspan fill="#7dd3fc">id=1  </tspan><tspan fill="#e6edf3">dx=</tspan><tspan fill="#fbbf77">+0.42</tspan><tspan fill="#e6edf3"> dy=</tspan><tspan fill="#fbbf77">+0.01</tspan><tspan fill="#6b7688">  px=(906,362) age=10</tspan></text>
+  <text x="24" y="204" xml:space="preserve"><tspan fill="#6b7688">[f:525] </tspan><tspan fill="#7dd3fc">id=1  </tspan><tspan fill="#e6edf3">dx=</tspan><tspan fill="#fbbf77">+0.29</tspan><tspan fill="#e6edf3"> dy=</tspan><tspan fill="#fbbf77">+0.02</tspan><tspan fill="#6b7688">  px=(824,368) age=25</tspan></text>
+  <text x="24" y="228" xml:space="preserve"><tspan fill="#6b7688">[f:540] </tspan><tspan fill="#7dd3fc">id=1  </tspan><tspan fill="#e6edf3">dx=</tspan><tspan fill="#fbbf77">+0.34</tspan><tspan fill="#e6edf3"> dy=</tspan><tspan fill="#fbbf77">+0.01</tspan><tspan fill="#6b7688">  px=(858,365) age=40</tspan></text>
+  <text x="24" y="252" xml:space="preserve"><tspan fill="#6b7688">[f:555] </tspan><tspan fill="#7dd3fc">id=1  </tspan><tspan fill="#e6edf3">dx=</tspan><tspan fill="#fbbf77">+0.37</tspan><tspan fill="#e6edf3"> dy=</tspan><tspan fill="#fbbf77">+0.01</tspan><tspan fill="#6b7688">  px=(875,363) age=55</tspan></text>
+  <text x="24" y="276" xml:space="preserve"><tspan fill="#6b7688">[f:690] </tspan><tspan fill="#7dd3fc">id=1  </tspan><tspan fill="#e6edf3">dx=</tspan><tspan fill="#f0883e">+0.62</tspan><tspan fill="#e6edf3"> dy=</tspan><tspan fill="#fbbf77">+0.06</tspan><tspan fill="#6b7688">  px=(1039,382) age=190</tspan></text>
+
+  <text x="24" y="302" xml:space="preserve"><tspan fill="#6b7688">[f:706] </tspan><tspan fill="#ff7b72">- </tspan><tspan fill="#a3b1c6">lock lost (</tspan><tspan fill="#7dd3fc">id=1</tspan><tspan fill="#a3b1c6">)</tspan></text>
+
+  <line x1="24" y1="326" x2="816" y2="326" stroke="#2c3444" stroke-width="1"/>
+
+  <text x="24" y="352" font-size="12.5" xml:space="preserve"><tspan fill="#6b7688">dx / dy   </tspan><tspan fill="#a3b1c6">offset from the frame center, normalized — 0.0 dead center, ±1.0 the edge</tspan></text>
+  <text x="24" y="374" font-size="12.5" xml:space="preserve"><tspan fill="#6b7688">age       </tspan><tspan fill="#a3b1c6">how many frames the object has been tracked without a break</tspan></text>
+  <text x="24" y="396" font-size="12.5" xml:space="preserve"><tspan fill="#f0883e">note      </tspan><tspan fill="#a3b1c6">the y axis grows downwards — a positive dy means the target is BELOW the center</tspan></text>
+</svg>

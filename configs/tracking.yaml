@@ -1,0 +1,137 @@
+# ===========================================================================
+#  TRACKING -- the single config file
+#
+#  Before you run it, change the two lines in the SETTING sections below:
+#    1) track_mode     -> how to track
+#    2) track_classes  -> what to track
+#
+#  Run:
+#    ./app_edgeai.py ../configs/tracking.yaml -n     (coordinate output)
+#    ./app_edgeai.py ../configs/tracking.yaml        (fps table)
+#
+#  Viewing (on the VM). VLC DOES NOT WORK, it wants an SDP file for raw RTP:
+#    gst-launch-1.0 udpsrc port=5000 \
+#      caps="application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000" \
+#      ! rtpjitterbuffer latency=0 ! rtph264depay ! avdec_h264 \
+#      ! autovideosink sync=false
+#
+#  The badge on the top left of the frame says what is happening right now:
+#    SEARCHING            no target, searching             (blue)
+#    LOCKED id=3          locked onto a single target       (green)
+#    TRACKING: 4 objects  multi mode, 4 objects tracked     (green)
+#
+#  When shutting down ALWAYS use Ctrl+C and wait for "APP: Deinit ... Done !!!".
+#  A dirty exit locks up TIOVX and the only cleanup is a reboot.
+# ===========================================================================
+
+title: "Tracking"
+log_level: 2
+
+inputs:
+    input0:
+        source: /dev/video-imx219-cam0
+        format: rggb
+        width: 1920
+        height: 1080
+        framerate: 30
+        subdev-id: /dev/v4l-imx219-subdev0
+
+models:
+    model0:
+        model_path: /opt/model_zoo/TFL-OD-2020-ssdLite-mobDet-DSP-coco-320x320
+
+        # =================== SETTING 1: TRACKING MODE =====================
+        #
+        # lock    Locks onto a single target and reports only that one. The
+        #         lock survives an identity change. Detection still runs on
+        #         every frame (on the C7x, so it costs the A53 nothing).
+        #         MEASURED: 29.13 fps on a live camera, 22.19 fps on file input.
+        #         >>> This is the right mode for gimbal / servo tracking. <<<
+        #
+        # multi   No lock. EVERY object in the frame gets its own id and all
+        #         of their coordinates are printed. For observing a scene,
+        #         counting, or seeing how many objects there are.
+        #         MEASURED: slightly below lock mode.
+        #
+        track_mode: lock
+
+        # =================== SETTING 2: WHAT TO TRACK ======================
+        #
+        # A list of class names. More than one can be given:
+        #     track_classes: [person, dog]
+        # An empty list tracks every class:
+        #     track_classes: []
+        #
+        # A wrong name prints a warning at startup along with examples of the
+        # valid names; it never silently tracks the wrong thing.
+        #
+        # The model is trained on COCO-80. Available names:
+        #
+        #   PEOPLE/ANIMALS  person, cat, dog, horse, sheep, cow, elephant,
+        #                   bear, zebra, giraffe, bird
+        #   VEHICLES        car, truck, bus, motorcycle, bicycle, train,
+        #                   airplane, boat
+        #   OBJECTS         backpack, umbrella, handbag, tie, suitcase,
+        #                   bottle, cup, fork, knife, spoon, bowl, chair,
+        #                   couch, bed, dining table, toilet, tv, laptop,
+        #                   mouse, remote, keyboard, cell phone, microwave,
+        #                   oven, sink, refrigerator, book, clock, vase,
+        #                   scissors, teddy bear, potted plant
+        #   SPORTS          sports ball, frisbee, skis, snowboard, kite,
+        #                   baseball bat, skateboard, surfboard, tennis racket
+        #   FOOD            banana, apple, sandwich, orange, broccoli, carrot,
+        #                   hot dog, pizza, donut, cake
+        #   TRAFFIC         traffic light, fire hydrant, stop sign,
+        #                   parking meter, bench
+        #
+        track_classes: [person]
+
+        # =================== FINE TUNING ==================================
+        # It works without touching any of these.
+
+        # Detection confidence threshold. Lowering it catches more objects but
+        # also raises false positives. The detector gets noisy at low
+        # confidence.
+        viz_threshold: 0.6
+
+        # How many frames an identity survives without a matching detection
+        # (at 30 fps, 30 = 1 s). The old value was 5 and even a person standing
+        # still changed identity a few times per minute. Raise it if you lose
+        # the target during brief occlusions.
+        hit_counter_max: 30
+
+        # Frames required before an object counts as "real". A false-positive
+        # filter; raising it helps in a noisy scene but delays locking onto
+        # the target.
+        initialization_delay: 4
+
+        # In lock mode, which candidate is picked while there is no lock:
+        #   closest_to_center  the one needing the least pan/tilt movement
+        #   largest            the biggest box, usually the nearest object
+        #   first              the first in the list, the cheapest
+        lock_policy: closest_to_center
+
+        enable_tracking: True
+
+outputs:
+    output0:
+        sink: remote
+        width: 1280
+        height: 720
+        port: 5000
+        host: 192.168.7.59
+        encoding: h264-rtp
+        bitrate: 4000000
+        gop-size: 30
+        # overlay-perf-type is left undefined ON PURPOSE. Adding it brings back
+        # TI's demo decorations (title, FPS/TEMP readout, bar graphs).
+
+    # To write the same frames to disk. To use it, put output1 instead of
+    # output0 in the flows section below.
+    output1:
+        sink: /opt/edgeai-test-data/output/tracking.mkv
+        width: 1280
+        height: 720
+
+flows:
+    flow0: [input0,model0,output0,[0,0,1280,720]]
