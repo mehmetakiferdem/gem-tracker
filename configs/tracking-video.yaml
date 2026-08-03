@@ -1,0 +1,61 @@
+# ===========================================================================
+#  Tracking - video file in, video file out
+#
+#  Same tracker as tracking.yaml, but reads a video file instead of the camera
+#  and writes an annotated file instead of streaming. Use it to try the tracker
+#  without a camera, or to check a change against a clip you already know.
+#
+#  Run:
+#    sudo su
+#    source /opt/t3-edgeai-env
+#    cd apps_python
+#    ./app_edgeai.py ../configs/tracking-video.yaml        (fps table)
+#    ./app_edgeai.py ../configs/tracking-video.yaml -n     (coordinate lines)
+#
+#  Keep the input at 1920x1080. At 720p the scaler drops to a single stage and
+#  the tensor branch comes back empty: "Error pulling tensor from GST Pipeline".
+#
+#  Output is .mkv on purpose. Matroska is written incrementally, so a run that
+#  is interrupted still leaves a playable file. mp4 only becomes readable once
+#  the muxer sees end of stream.
+# ===========================================================================
+
+title: "Tracking - video"
+log_level: 2
+
+inputs:
+    input0:
+        # An H.264 elementary stream or an mp4. Point this at your own clip.
+        source: /home/gemstone/clip.h264
+        format: h264
+        width: 1920
+        height: 1080
+        framerate: 30
+        # True replays the clip forever. False stops at the end.
+        loop: False
+
+models:
+    model0:
+        model_path: /opt/model_zoo/TFL-OD-2020-ssdLite-mobDet-DSP-coco-320x320
+
+        # lock  = follow one target only, keep the lock through id changes
+        # multi = give every object its own id and report all of them
+        track_mode: lock
+
+        # Any COCO class name. An empty list tracks every class.
+        track_classes: [person]
+
+        viz_threshold: 0.6
+        hit_counter_max: 30
+        initialization_delay: 4
+        lock_policy: closest_to_center
+        enable_tracking: True
+
+outputs:
+    output0:
+        sink: /home/gemstone/tracked.mkv
+        width: 1280
+        height: 720
+
+flows:
+    flow0: [input0,model0,output0,[0,0,1280,720]]

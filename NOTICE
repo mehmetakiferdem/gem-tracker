@@ -1,0 +1,87 @@
+NOTICE
+======
+
+This project was not written from scratch. It is derived from Texas
+Instruments' Edge AI GStreamer apps and contains third-party components.
+
+
+Sources it derives from
+-----------------------
+
+1. TexasInstruments/edgeai-gst-apps
+   https://github.com/TexasInstruments/edgeai-gst-apps
+
+   This forms the basis of the repository. Most of the code under apps_python/,
+   configs/, scripts/ and docker/ comes directly from there. The GStreamer
+   pipeline setup, config parsing, the pre/post-processing framework and the
+   model zoo integration belong to TI.
+
+2. TexasInstruments-Sandbox/edgeai-gst-apps-people-tracking
+   https://github.com/TexasInstruments-Sandbox/edgeai-gst-apps-people-tracking
+
+   The Norfair-based object tracking logic comes from there. apps_python/
+   path_draw.py comes from that repository; the tracking core of the
+   PostProcessTracking class in post_process.py (the Norfair Tracker settings
+   and the conversion of detections into Norfair Detection objects) is based on
+   the implementation in that repository.
+
+Both repositories are copyright Texas Instruments Incorporated.
+
+
+Changes made in this repository
+-------------------------------
+
+- The dashboard layer (dashboard.py, lite_plot.py, heat_map.py,
+  object_time_count.py) was removed entirely; the matplotlib dependency is gone.
+- The upstream apps_cpp/ (C++ applications), optiflow/ and tests/ trees were
+  removed; this project only uses the Python side and had no dependency on
+  those trees. If you need them, take them from the upstream repository above.
+  scripts/compile_cpp_apps.sh and the setup_script.sh step that called it were
+  removed for the same reason.
+- Bounding box drawing with an identity label was added for every tracked
+  object.
+- Coordinate output normalized against the frame center (dx/dy) and terminal
+  reporting were added (PostProcessTracking.tracked_positions).
+- The config path in gst_element_map.py was made relative.
+- Configuration for the T3 Gemstone O1 / AM67A board and the IMX219 camera was
+  added.
+
+
+License status — ATTENTION
+--------------------------
+
+Two different license texts sit side by side in this repository and they are
+NOT the same thing:
+
+* The LICENSE file in the root directory is the "Texas Instruments Text File
+  License" text (Copyright (c) 2023 Texas Instruments Incorporated). That text
+  limits redistribution and use to "TI Devices" and is NOT an OSI-approved open
+  source license. This file was inherited as-is from both upstream repositories
+  and has not been modified.
+
+* The copyright headers in the source files under apps_python/, on the other
+  hand, are BSD-3-Clause text. Those headers have been preserved; do not remove
+  them.
+
+The inconsistency between these two texts was inherited from the upstream
+repositories, it was not created here. Before publishing the repository under
+your own name or using it in a commercial product, you are advised to clarify
+with Texas Instruments which terms apply.
+
+
+Third-party dependencies
+------------------------
+
+* Norfair — https://github.com/tryolabs/norfair
+  Copyright (c) 2022, Tryolabs
+  License: BSD-3-Clause
+
+  (Older versions of Norfair were MIT licensed; version 2.3.0 used in this
+  project is BSD-3-Clause. Verified at:
+  /usr/local/lib/python3.10/dist-packages/norfair-2.3.0.dist-info/LICENSE)
+
+* OpenCV, NumPy, PyYAML, PyGObject/GStreamer — shipped with the board image,
+  under their own licenses.
+
+* Models come from the TI Model Zoo under /opt/model_zoo and are not included
+  in this repository; they are subject to their own license terms.
