@@ -1,0 +1,22 @@
+# /etc/systemd/system/object-tracker.service
+[Unit]
+Description=T3 Gemstone Object Tracker Service
+# multi-user.target used to be here too, which held the tracker back until
+# every other service (the USB gadget one alone takes ~5 s) had finished.
+After=systemd-udevd.service systemd-modules-load.service network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/bin/bash /home/gemstone/object-tracker-o1/start_tracking.sh
+WorkingDirectory=/home/gemstone/object-tracker-o1
+Restart=always
+RestartSec=5
+# Stop it the way Ctrl+C does. On the default SIGTERM Python dies without
+# running APP: Deinit, which can leave TIOVX locked ("Unable to init TIOVX
+# module" on every later start) until the board is rebooted.
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

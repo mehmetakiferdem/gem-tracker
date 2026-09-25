@@ -1,0 +1,288 @@
+================================================================================
+ T3 GEMSTONE O1 - YÜZ TAKİP (object-tracker-o1) - DEVİR NOTLARI
+ Son güncelleme: 2026-09-25
+================================================================================
+
+İÇİNDEKİLER
+  1. Kartla bağlantı
+  2. Şu anki durum ve açık işler
+  3. Sistem nasıl çalışıyor
+  4. Dosyalar ve nerede oldukları
+  5. Önemli ayarlar (configs/tracking.yaml)
+  6. Yapılan değişiklikler ve nedenleri
+  7. Ekran (DSI panel) kurulumu
+  8. Ölçümler
+  9. TUZAKLAR - mutlaka oku
+ 10. Sık kullanılan komutlar
+ 11. Yedekler / geri alma
+
+
+--------------------------------------------------------------------------------
+1. KARTLA BAĞLANTI
+--------------------------------------------------------------------------------
+  Kullanıcı         : gemstone (şifre depoda tutulmuyor)
+  USB-C ağı         : ssh gemstone@192.168.7.2   (PC tarafı 192.168.7.x alır)
+  Wi-Fi (wlan0)     : <wlan0 adresi> (DHCP, değişebilir)
+  Hostname          : t3-gem-o1
+  OS                : Ubuntu tabanlı Gemstone imajı, kernel 6.12.24-ti PREEMPT_RT,
+                      TI Processor SDK 11_00_00, SoC J722S / AM67A
+  Önyükleme         : SD KARTTAN açılıyor (mmcblk1). eMMC (mmcblk0) de takılı.
+
+  Web görüntü (tarayıcıdan)   : http://192.168.7.2:8080/   (USB ile bağlı PC'den)
+                                http://<wlan0 adresi>:8080/  (aynı Wi-Fi'deki cihazdan)
+  RTP H.264 yayını            : <RTP alıcısı>:5000'e gidiyor (kullanıcının istediği adres)
+    izlemek için (o makinede):
+      gst-launch-1.0 udpsrc port=5000 \
+        caps="application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000" \
+        ! rtpjitterbuffer latency=0 ! rtph264depay ! avdec_h264 ! autovideosink sync=false
+    VLC ham RTP'yi SDP'siz açamaz (örnek SDP: ~/gemstone/kamera.sdp).
+
+
+--------------------------------------------------------------------------------
+2. ŞU ANKİ DURUM VE AÇIK İŞLER
+--------------------------------------------------------------------------------
+  DURUM (2026-09-25):
+  - 5" ekran yerine 7" Waveshare DSI ekran takıldı. Bundan sonra kart AÇILMADI /
+    ağa gelmedi (USB'de de, Wi-Fi'de de görünmüyor).
+    En olası neden: GÜÇ. 7" arka ışık fazla akım çekiyor, PC USB-C portu yetmiyor
+    olabilir. Kartı ayrı 5V/3A USB-C adaptörle besle.
+  - SD karttaki overlay şu an: k3-am67a-t3-gem-o1-dsi-rpi-7inch-panel.dtbo
+    (5" "RPi uyumlu" panel için seçilmişti). Waveshare'in RPi uyumlu 7" DSI'si
+    ise büyük ihtimalle aynı overlay ile çalışır.
+
+  YAPILACAKLAR:
+  [ ] Kartı güçlü adaptörle aç, 7" panelin modelini öğren (etiket: "7inch DSI LCD",
+      "(C)", "(H)" ...). Sonra:
+        for c in /sys/class/drm/card*-*; do echo $c $(cat $c/status) $(cat $c/modes); done
+        sudo i2cdetect -r -y 3 0x08 0x77      # 0x45 = panel MCU, 0x38 = FT5x06 touch,
+                                              # 0x14/0x5d = Goodix touch
+      Kartta hazır overlay'ler (boot bölümünde overlays/):
+        k3-am67a-t3-gem-o1-dsi-rpi-7inch-panel.dtbo        (RPi resmi + uyumlular, 800x480, FT5406 @0x38)
+        k3-am67a-t3-gem-o1-dsi-waveshare-7inch-panel.dtbo
+        k3-am67a-t3-gem-o1-dsi-waveshare-7inch-h-panel.dtbo
+      Önce overlay'i PC'de dene: fdtoverlay -i k3-am67a-t3-gem-o1.dtb -o m.dtb <tüm overlay'ler sırayla>
+  [ ] 7" çözünürlüğe göre arayüz: panel_ui.py buton boyutları sabit piksel
+      (BTN=64, EFFECT_R=27, FIRE_R=40) -> panel çözünürlüğüne göre ölçekle.
+      fb_view.py çözünürlüğü /sys/class/graphics/fb0'dan kendisi okur, 32 bpp şart.
+      Dokunmatik ekseni yeni panelde farklı olabilir -> köşe testi yap (bölüm 10).
+  [ ] Pan mekanik sınırı ±90°. Kullanıcı genelde pan 50-90° bölgesinde oturuyordu;
+      düzeneği kullanıcıya doğru çevirmek iyi olur.
+  [ ] (İsteğe bağlı) Yüz modeli 15 FPS. İki C7x çekirdeği var; çıkarımı
+      çizim/gönderim ile paralel (pipeline) çalıştırmak 30 FPS'e yaklaştırabilir.
+  [ ] Değişiklikler git'e COMMIT EDİLMEDİ (kartta ~/object-tracker-o1, dal main,
+      HEAD 269e5a1). Bu klasördeki kopya ile karttaki aynıdır (2026-09-24 akşamı).
+
+
+--------------------------------------------------------------------------------
+3. SİSTEM NASIL ÇALIŞIYOR
+--------------------------------------------------------------------------------
+  IMX219 kamera (CSI0, 1920x1080 @30) -> tiovxisp -> tiovxmultiscaler
+     |-> 1280x720 RGB  -> Python (Norfair izleme + çizim)  -> H.264 -> RTP <RTP alıcısı>:5000
+     |                                                      -> MJPEG web :8080
+     |                                                      -> DSI panel (/dev/fb0)
+     `-> 640x360 (letterbox ile 640x640) -> C7x: YOLOX-s WIDER FACE yüz modeli
+
+  Model : /opt/model_zoo/ONR-OD-8420-yolox-s-lite-mmdet-widerface-640x640, sınıf "face"
+          (kişi takibi için: TFL-OD-2020-ssdLite-mobDet-DSP-coco-320x320 + [person])
+  Mod   : lock -> tek hedefe kilitlenir; hedef kaybolunca 1 s bekler, sonra
+          dur-kalk tarama yapar (10° atla, 0.8 s dur, pan -60..+60).
+  Servo : donanım PWM epwm1 (23010000.pwm), sysfs /sys/class/pwm/pwmchipN.
+          pan = PWM kanal 0 (GPIO6), tilt = PWM kanal 1 (GPIO13).
+  Servis: object-tracker.service (root) -> /home/gemstone/object-tracker-o1/start_tracking.sh
+          açılışta otomatik başlar (enabled).
+
+  EKRAN ARAYÜZÜ (panel_ui.py, sadece panelde; web/RTP'de yok):
+    Yön okları (sağ alt)   : basılı tut -> kamera döner (30°/s), MANUEL mod
+    OTO/MANUEL (sol alt)   : otomatik takibe dön
+    ATES (altta kırmızı)   : servo geri tepme + VURULDU!/ISKA efekti, SKOR
+    Efekt butonları (sağ)  : SADE / NISAN / GECE / TERMAL
+    Bir yüze dokun         : kilidi o yüze geçir (diğer yüzler gri köşeli)
+    Boşluğa dokun          : kilidi bırak, otomatik seçime dön
+
+
+--------------------------------------------------------------------------------
+4. DOSYALAR VE NEREDE OLDUKLARI
+--------------------------------------------------------------------------------
+  Bu PC'de:
+    ~/gemstone/object-tracker-o1-degisiklikler/      <- kodun güncel tam kopyası
+      apps_python/                (tüm Python dosyaları, son hali)
+      configs/tracking.yaml       (son ayarlar)
+      configs/gst_plugins_map.yaml, tracking-video.yaml (orijinal depodan)
+      start_tracking.sh           (karttaki son hali)
+      sistem/object-tracker.service   (-> /etc/systemd/system/)
+      sistem/uEnv-overlays.txt    (SD boot overlay satırı)
+      sistem/prof_*.py            (aşama süresi ölçüm aracı)
+      sistem/dirtest.py           (servo->görüntü kayma yönü ölçümü; güvenilmez çıktı!)
+    ~/gemstone/object-tracker-o1-degisiklikler.tar.gz  <- aynısı, tek dosya
+    ~/gemstone/kamera.sdp        (VLC için RTP SDP örneği)
+
+  Kartta:
+    ~/object-tracker-o1/                 depo (orijinal: github.com/MehmetEmreee/object-tracker-o1)
+    ~/*.bak-2026092x-*                   değiştirilen her dosyanın önceki hali
+    /opt/tracker-pylibs/                 headless OpenCV 4.10 (sadece bu uygulama için)
+    /etc/systemd/system/object-tracker.service
+    SD boot: /dev/mmcblk1p1 (uEnv.txt, overlays/) - /boot'a BAĞLI DEĞİL, elle mount et
+
+  Yeni / değişen Python modülleri (orijinal depoya göre):
+    post_process.py   izleme, kilit, servo kontrolcüsü (PanTiltServoController),
+                      kamera hareketi telafisi, dokunma, ateş, HUD bağlantısı
+    gst_wrapper.py    udpsink önüne leaky queue
+    infer_pipe.py     letterbox dolgusu; döngü hatası artık uygulamayı kapatıyor
+    config_parser.py  letterbox için ölçekleyici boyutu
+    edge_ai_class.py  resize_with_pad okuma, yeni config anahtarları
+    web_view.py       (YENİ) MJPEG tarayıcı görüntüsü
+    fb_view.py        (YENİ) DSI panele framebuffer ile çizim, renk filtresi
+    touch_input.py    (YENİ) evdev dokunmatik okuyucu
+    panel_ui.py       (YENİ) ekran butonları
+    hud.py            (YENİ) SADE/NISAN/GECE/TERMAL efektleri, ateş efekti
+
+
+--------------------------------------------------------------------------------
+5. ÖNEMLİ AYARLAR (configs/tracking.yaml, models.model0)
+--------------------------------------------------------------------------------
+  model_path            ONR-OD-8420-yolox-s-lite-mmdet-widerface-640x640
+  track_mode            lock
+  track_classes         [face]
+  viz_threshold         0.5
+  hit_counter_max       30          initialization_delay 4
+  lock_policy           closest_to_center
+
+  servo_backend         hwpwm
+  servo_pan_pwm_channel 0           servo_tilt_pwm_channel 1     (ÖLÇÜLDÜ, eski config tersti)
+  servo_pan_invert      False       servo_tilt_invert      True  (LOGLA DOĞRULANDI)
+  servo_gain            0.20        servo_max_step         2.5 (derece/kare)
+  servo_deadzone        0.03        servo_aim_y            0.5 (yüz kutusu ortası)
+  servo_hfov / vfov     40 / 23
+  servo_search          True, delay 1.0 s, step 10°, dwell 0.8 s, pan [-60,60], tilt 0
+  servo_debug           False       (True: kilitliyken her kare [SERVO] satırı)
+  (kodda varsayılan)    servo_motion_compensation True, servo_motion_delay 2,
+                        servo_manual_speed 30
+
+  web_view_port         8080
+  display_fb            /dev/fb0    display_rotate 0     display_touch auto
+  hud_style             aim         (plain | aim | night | thermal)
+
+  outputs.output0       remote, h264-rtp, host <RTP alıcısı>, port 5000, 1280x720, 4 Mbit
+
+
+--------------------------------------------------------------------------------
+6. YAPILAN DEĞİŞİKLİKLER VE NEDENLERİ (kronolojik özet)
+--------------------------------------------------------------------------------
+  1) Donma / düşük FPS: udpsink, ulaşılamayan RTP alıcısında (ARP çözülemeyince)
+     2-3 s bloklanıyor, appsrc block=True yüzünden tüm döngü duruyordu.
+     -> udpsink önüne leaky queue (200 ms). 5.5 FPS -> 30 FPS (kişi modeli).
+  2) Servo tahmin kutusunu kovalıyordu -> sadece o karede gerçekten tespit edilen
+     (live) hedefte servo hareket eder, tahminde bekler.
+  3) Açılış: servis After=multi-user.target'ı bekliyordu (-5 s kaldırıldı);
+     sistem cv2'si 355 kütüphane (soğuk açılışta ~9 s) -> headless OpenCV
+     /opt/tracker-pylibs. Soğuk açılışta ilk kare ~21 s -> ~16.5 s.
+  4) SIGTERM ile durdurma TIOVX'i kilitledi -> KillSignal=SIGINT + exec.
+  5) Arama modu eklendi (sonra dur-kalk yapıldı; sürekli dönüş bulanıklaştırıyordu).
+  6) Kişi -> yüz modeli. Uygulama 16:9'u 640x640'a geriyordu, yüzler %44 dar,
+     skor 0.3-0.6 -> letterbox (640x360 + gri dolgu), skor ~0.8.
+  7) Kamera hareketi telafisi: Norfair'e servo açısından TranslationTransformation
+     veriliyor; yoksa kamera dönüşü hedef hızı sanılıp kilit 1-2 s'de kopuyordu.
+  8) Pan/tilt PWM kanalları ters bağlıydı -> değiştirildi, yönler logla doğrulandı.
+     Sonuç: 50 s boyunca kopmasız kilit, dx/dy ~0'a yakınsıyor.
+  9) Web görüntü (MJPEG), DSI panel çıkışı, dokunmatik, ekran butonları,
+     efektler, ateş butonu eklendi.
+ 10) HUD'da ters kutu (x2<x1) cv2.ellipse'i patlatıp döngüyü öldürüyordu ->
+     kutu normalize, HUD hatası kareyi atlar, döngü ölürse uygulama kapanıp
+     systemd yeniden başlatır.
+
+
+--------------------------------------------------------------------------------
+7. EKRAN (DSI PANEL) KURULUMU
+--------------------------------------------------------------------------------
+  - 5" deneyiminden: ilk seçilen k3-...-dsi-waveshare-5-0inch-panel.dtbo YANLIŞTI
+    (720x1280, Goodix @0x14 bekliyor, cevap yoktu). Takılı olan 800x480 RPi uyumlu
+    modeldi (FT5406 @0x38) -> k3-...-dsi-rpi-7inch-panel.dtbo ile çalıştı,
+    dokunmatik eksenleri doğru (sol üst ~25,26 ; sağ alt ~780,451).
+  - Paylaşılan MIPI anahtarı DSI0 <-> CSI1 arasında; kamera CSI0'da, etkilenmez.
+  - Framebuffer: 32 bpp XRGB. fb_view.py tty1'i KD_GRAPHICS'e alır (konsol yazısı
+    görüntünün üstüne binmesin), çıkışta geri verir.
+  - Sürücüler çekirdekte var: panel_simple, tc358762, rpi_panel_attiny_regulator,
+    edt_ft5x06 (built-in), panel_waveshare_dsi, goodix_ts.
+
+
+--------------------------------------------------------------------------------
+8. ÖLÇÜMLER
+--------------------------------------------------------------------------------
+  Kişi modeli (ssdLite 320): çıkarım ~17-19 ms, toplam ~33 ms/kare -> 30 FPS (kamera sınırı)
+  Yüz modeli (yolox-s 640) : çıkarım ~53 ms, toplam ~67 ms/kare  -> ~15 FPS
+  Kare başına A53 işi      : pull_tensor ~1-2, pull_frame ~5, post ~3.5, push ~4 ms
+  HUD NISAN                : ~4 ms (ana döngüde)
+  GECE/TERMAL renk filtresi: panel iş parçacığında (ana döngüde 12-20 ms tutuyordu)
+  Ateş parlaması           : ~18 ms, sadece 2 kare
+  Web MJPEG                : ~13-15 FPS, 640 px genişlik, bağlantı yokken maliyetsiz
+
+
+--------------------------------------------------------------------------------
+9. TUZAKLAR - MUTLAKA OKU
+--------------------------------------------------------------------------------
+  * Uygulamayı HER ZAMAN SIGINT (Ctrl+C / systemctl stop) ile durdur. SIGTERM/kill
+    TIOVX'i kilitler: sonraki her açılışta "Unable to init TIOVX module" /
+    "Error pulling tensor" / segfault döngüsü. Tek çare: kartı yeniden başlat.
+  * `pkill -f <desen>` KULLANMA: SSH ile verilen komut satırının kendisini de
+    eşleştirip oturumu öldürüyor (birkaç kez oldu).
+  * SSH'de `echo <şifre> | sudo -S ... <<EOF` çalışmaz (heredoc, şifrenin stdin'ini
+    ezer) -> betiği önce dosyaya yaz, sonra sudo ile çalıştır.
+  * /boot eMMC'nin boot bölümü; kart SD'den açılıyor. uEnv.txt'yi
+    /dev/mmcblk1p1'de düzenle (sudo mount /dev/mmcblk1p1 /mnt/sdboot).
+  * Servo yönünü tahminle değiştirme. servo_debug: True yap, kilitliyken
+    [SERVO] satırlarına bak: servo dönerken |dx| ve |dy| KÜÇÜLMELİ. Bir kez
+    kullanıcı yorumuna ve faz korelasyonu ölçümüne güvenip yanlış çevrildi.
+  * Ölçüm için servisi durdurunca web/panel görüntüsü de gider; bittiğinde
+    servisi yeniden başlatmayı unutma.
+  * journalctl'de Python stdout tamponlu; zaman damgaları gerçeği göstermeyebilir
+    (flush=True olan satırlar hariç).
+  * Kartta fdtoverlay/dtc yok; overlay birleştirme testini PC'de yap.
+  * RTP hedefi (<RTP alıcısı>) kapalıyken bile artık tracker donmaz (leaky queue),
+    ama o makineye görüntü gitmez; ping ile kontrol et.
+
+
+--------------------------------------------------------------------------------
+10. SIK KULLANILAN KOMUTLAR
+--------------------------------------------------------------------------------
+  Servis:
+    sudo systemctl start|stop|restart object-tracker
+    systemctl is-active object-tracker
+    sudo journalctl -u object-tracker -f -o cat
+    sudo journalctl -u object-tracker -o cat | grep "APP: Deinit ... Done"   # temiz kapanış
+
+  Kodu karta gönder (bu klasörden):
+    scp apps_python/*.py gemstone@192.168.7.2:/tmp/
+    ssh gemstone@192.168.7.2 'sudo cp /tmp/*.py ~/object-tracker-o1/apps_python/ && sudo systemctl restart object-tracker'
+    (dosyalar root sahipli -> sudo cp)
+
+  Aşama süresi ölçümü (servis durdurulmuşken, kartta):
+    scp sistem/prof_infer_pipe.py sistem/prof_main.py gemstone@192.168.7.2:/tmp/
+    # prof_main.py başına: import sys, os; sys.path.insert(0, os.getcwd())
+    source /opt/t3-edgeai-env; export PYTHONPATH=/opt/tracker-pylibs:/tmp:$PYTHONPATH
+    bash /opt/edgeai-gst-apps/scripts/setup_cameras.sh
+    cd ~/object-tracker-o1/apps_python && sudo -E timeout -s INT 40 python3 -u /tmp/prof_main.py
+
+  Servo açıları (anlık):
+    for p in 0 1; do echo pwm$p $(( ($(cat /sys/class/pwm/pwmchip4/pwm$p/duty_cycle)/1000-1500)*90/1000 )); done
+    (pwmchip numarası değişebilir; 23010000.pwm'e bağlı olanı bul)
+
+  Panel ekran görüntüsü al:
+    sudo head -c $((800*480*4)) /dev/fb0 > /tmp/fb.raw     # BGRA, 800x480 için
+
+  Dokunmatik ham test: /dev/input/eventN, struct "llHHi" (type, code, value);
+    ABS_MT_POSITION_X=53, Y=54, BTN_TOUCH=330.
+
+
+--------------------------------------------------------------------------------
+11. YEDEKLER / GERİ ALMA
+--------------------------------------------------------------------------------
+  Kartta değiştirilen her dosyanın önceki hali: ~/<dosya>.bak-YYYYMMDD-HHMMSS
+  SD uEnv yedekleri: /dev/mmcblk1p1 üzerinde uEnv.txt.bak-20260923-154354,
+                     uEnv.txt.bak-20260924-123023 (panel overlay'i eklenmeden önceki)
+  eMMC uEnv.txt yanlışlıkla bir kez düzenlendi, yedeğinden geri alındı (değişmedi).
+  Headless OpenCV'yi kaldırmak: sudo rm -rf /opt/tracker-pylibs ve
+    start_tracking.sh'deki PYTHONPATH satırını sil.
+  Kişi takibine dönmek: tracking.yaml'de model_path'i COCO modeline,
+    track_classes: [person], servo_aim_y: 0.15.
+
+================================================================================

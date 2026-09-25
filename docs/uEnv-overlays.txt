@@ -1,0 +1,4 @@
+# SD kart boot bölümü (/dev/mmcblk1p1) uEnv.txt içindeki overlays satırı, 2026-09-24:
+overlays=k3-am67a-t3-gem-o1-csi0-imx219.dtbo k3-am67a-t3-gem-o1-edgeai-apps.dtbo k3-am67a-t3-gem-o1-pwm-epwm1-gpio6-gpio13.dtbo k3-am67a-t3-gem-o1-dsi-rpi-7inch-panel.dtbo
+# DİKKAT: /boot eMMC'nin boot bölümüne (mmcblk0p1) bağlı, kart SD'den açılıyor.
+# Düzenlemek için: sudo mount /dev/mmcblk1p1 /mnt/sdboot

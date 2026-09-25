@@ -38,7 +38,11 @@ inputs:
 
 models:
     model0:
-        model_path: /opt/model_zoo/TFL-OD-2020-ssdLite-mobDet-DSP-coco-320x320
+        # FACE tracking (WIDER FACE, one class: face). For whole-body
+        # tracking put the COCO model back and set track_classes: [person]
+        # and servo_aim_y: 0.15 below:
+        #   model_path: /opt/model_zoo/TFL-OD-2020-ssdLite-mobDet-DSP-coco-320x320
+        model_path: /opt/model_zoo/ONR-OD-8420-yolox-s-lite-mmdet-widerface-640x640
 
         # =================== SETTING 1: TRACKING MODE =====================
         #
@@ -84,7 +88,7 @@ models:
         #   TRAFFIC         traffic light, fire hydrant, stop sign,
         #                   parking meter, bench
         #
-        track_classes: [person]
+        track_classes: [face]        # [person] with the COCO model
 
         # =================== FINE TUNING ==================================
         # It works without touching any of these.
@@ -92,7 +96,7 @@ models:
         # Detection confidence threshold. Lowering it catches more objects but
         # also raises false positives. The detector gets noisy at low
         # confidence.
-        viz_threshold: 0.6
+        viz_threshold: 0.5           # 0.6 with the COCO person model
 
         # How many frames an identity survives without a matching detection
         # (at 30 fps, 30 = 1 s). The old value was 5 and even a person standing
@@ -113,13 +117,83 @@ models:
 
         enable_tracking: True
 
+        # Browser view of the output with boxes and badge, MJPEG:
+        #   http://192.168.7.2:8080/   over the USB cable
+        #   http://<wlan0 address>:8080/  over Wi-Fi
+        # 0 turns it off. Costs nothing while no browser is open.
+        web_view_port: 8080
+
+        # Local panel through the framebuffer. "" turns it off. The Waveshare
+        # 5" DSI LCD here is the 800x480 Raspberry Pi compatible one (overlay
+        # k3-am67a-t3-gem-o1-dsi-rpi-7inch-panel.dtbo), landscape, so no
+        # rotation; the picture is scaled to fit. 90/180/270 for a panel
+        # mounted another way.
+        display_fb: /dev/fb0
+        display_rotate: 0
+        # Touchscreen: tap a face to lock onto it, tap elsewhere to release.
+        # auto finds the FT5x06 of this panel, "" turns it off.
+        display_touch: auto
+        # Picture style at start: plain | aim | night | thermal (see hud.py).
+        # The round buttons on the panel switch it while running.
+        hud_style: aim
+
+        # =================== PAN/TILT SERVO ================================
+        # hwpwm  hardware PWM, no jitter (default). epwm1 = 23010000.pwm,
+        #        channel 0 = GPIO6 (pin 31), channel 1 = GPIO13 (pin 33).
+        #        Needs overlay k3-am67a-t3-gem-o1-pwm-epwm1-gpio6-gpio13.dtbo
+        #        in /boot/uEnv.txt.
+        # lgpio  software PWM, pan GPIO17 / tilt GPIO27 (old wiring).
+        servo_backend: hwpwm
+        servo_pan_pwm_channel: 0     # GPIO6  (2026-09-24: measured, channel 0 is the horizontal axis)
+        servo_tilt_pwm_channel: 1    # GPIO13 (channel 1 moves the picture vertically, 29 px/deg)
+        # Seconds at rest before the pulses are cut, 0 = always hold.
+        servo_release_after: 0
+        #
+        # Direction. dx > 0 (target right) lowers the pan angle, dy > 0
+        # (target below) lowers the tilt angle. If an axis runs AWAY from the
+        # target, flip its invert flag.
+        servo_pan_invert: False    # 2026-09-24: True ran away on channel 0 in both directions; False converged
+        servo_tilt_invert: True    # 2026-09-24 measured: +1 deg on channel 1 moves the picture up
+
+        # Aim point inside the box, fraction of its height from the top.
+        # 0.15 = head of a person, 0.5 = box centre.
+        servo_aim_y: 0.5             # face box centre; 0.15 for a person box
+
+        # Fraction of the error corrected per frame. Higher is faster but
+        # starts to overshoot and oscillate (camera latency). 0.08 - 0.15.
+        servo_gain: 0.20             # face model runs ~15 fps; 0.10 at 30 fps
+        # Largest single move, degrees per frame (1.5 at 30 fps = 45 deg/s).
+        servo_max_step: 2.5          # 37 deg/s at 15 fps; 1.5 could not keep up with a walking person
+        # Normalized error treated as centred (0.03 = 3% of half the frame).
+        servo_deadzone: 0.03
+        # Camera field of view in degrees, turns the error into an angle.
+        # IMX219 1920x1080 mode with the stock lens is about 40 x 23.
+        servo_hfov: 40
+        servo_vfov: 23
+        # Log every locked frame ([SERVO] lines): score, live, error, angles.
+        servo_debug: False
+
+        # Search. With no target the rig first holds still where the target
+        # was lost for servo_search_delay seconds, then sweeps the pan axis
+        # back and forth between the servo_search_pan limits, starting towards
+        # the side the target left on, with tilt at servo_search_tilt. The
+        # sweep is stop and go, servo_search_step degrees then
+        # servo_search_dwell seconds still: a camera in motion blurs indoors
+        # and the detector finds nothing in blurred frames.
+        servo_search: True
+        servo_search_delay: 1.0      # seconds
+        servo_search_step: 10        # degrees per hop (FOV is ~40)
+        servo_search_dwell: 0.8      # seconds still after each hop
+        servo_search_pan: [-60, 60]  # degrees
+        servo_search_tilt: 0         # degrees, raise it if the camera looks too low
+
 outputs:
     output0:
         sink: remote
         width: 1280
         height: 720
         port: 5000
-        host: 192.168.7.59
+        host: 10.0.11.166
         encoding: h264-rtp
         bitrate: 4000000
         gop-size: 30

@@ -107,6 +107,31 @@ class EdgeAIDemo:
                 # Initialize the runtime
                 model_obj.create_runtime()
 
+                # Letterbox. edgeai_dl_inferer ignores preprocess.resize_with_pad,
+                # so the app used to stretch 16:9 frames onto a square input.
+                # A model trained on padded input (the YOLOX ones, the WIDER
+                # FACE face detector among them) then sees every face ~44%
+                # too narrow, and its scores sat around 0.3-0.6 for a face
+                # filling the frame. Only "corner" padding (image top left,
+                # pad right and bottom) is implemented; see InferPipe.
+                model_obj.letterbox = False
+                model_obj.pad_color = 114
+                try:
+                    import yaml as _yaml
+                    with open(os.path.join(model_path, "param.yaml")) as f:
+                        pre = _yaml.safe_load(f).get("preprocess", {})
+                    rwp = pre.get("resize_with_pad", False)
+                    if isinstance(rwp, list):
+                        model_obj.letterbox = bool(rwp[0]) and (
+                            len(rwp) < 2 or rwp[1] == "corner"
+                        )
+                    else:
+                        model_obj.letterbox = bool(rwp)
+                    pad = pre.get("pad_color", 114)
+                    model_obj.pad_color = pad[0] if isinstance(pad, list) else pad
+                except (OSError, AttributeError, TypeError):
+                    pass
+
                 # task specific params
                 if "alpha" in model_config:
                     model_obj.alpha = model_config["alpha"]
@@ -146,8 +171,20 @@ class EdgeAIDemo:
                     "redetect_interval",
                     "hit_counter_max",
                     "initialization_delay",
+                    "web_view_port",
+                    "display_fb",
+                    "display_rotate",
+                    "display_touch",
+                    "hud_style",
                 ):
                     if key in model_config:
+                        setattr(model_obj, key, model_config[key])
+
+                # Pan/tilt servo tuning, every servo_* key. Documented on
+                # PanTiltServoController in post_process.py and in
+                # configs/tracking.yaml.
+                for key in model_config:
+                    if key.startswith("servo_"):
                         setattr(model_obj, key, model_config[key])
 
                 self.models[model] = model_obj

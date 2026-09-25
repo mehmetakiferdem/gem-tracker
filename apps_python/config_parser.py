@@ -300,6 +300,16 @@ class SubFlow:
                 ((cam_dims[0] * resize // min(cam_dims)) >> 1) << 1,
                 ((cam_dims[1] * resize // min(cam_dims)) >> 1) << 1,
             )
+        elif getattr(self.model, "letterbox", False):
+            # Fit the frame inside the model input keeping its aspect ratio;
+            # InferPipe pads the rest. Even sizes for tiovxmultiscaler.
+            rw, rh = self.model.resize
+            scale = min(rw / self.input.width, rh / self.input.height)
+            self.pre_proc_resize = (
+                (int(self.input.width * scale) >> 1) << 1,
+                (int(self.input.height * scale) >> 1) << 1,
+            )
+            self.model.letterbox_size = self.pre_proc_resize
         else:
             self.pre_proc_resize = self.model.resize
 

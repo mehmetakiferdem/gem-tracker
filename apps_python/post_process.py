@@ -241,8 +241,11 @@ class PostProcessDetection(PostProcess):
             ]
 
         if not self.model.normalized_detections:
-            bbox[..., (0, 2)] /= self.model.resize[0]
-            bbox[..., (1, 3)] /= self.model.resize[1]
+            # With a letterboxed input the image only fills letterbox_size of
+            # the model input (top left), so normalise against that.
+            norm = getattr(self.model, "letterbox_size", None) or self.model.resize
+            bbox[..., (0, 2)] /= norm[0]
+            bbox[..., (1, 3)] /= norm[1]
 
         for b in bbox:
             if b[5] > self.model.viz_threshold:
@@ -506,6 +509,462 @@ class VisualTrack:
         self.age = age
 
 
+
+
+class PanTiltServoController:
+    """
+    Pan/tilt servo loop for the T3 Gemstone.
+
+    The camera sits on the servos, so dx/dy is the error left over after the
+    last move. Every frame the commanded angle is nudged by a fixed fraction
+    (gain) of that error, converted to degrees through the camera field of
+    view. Two things shape the gain:
+
+      - The picture reaches us several frames after it was taken, so the error
+        we see still contains moves we already made. A gain of 1.0 (correct the
+        whole error at once) therefore overshoots and oscillates. 0.08-0.15 is
+        the stable range at 30 fps.
+      - max_step caps a single update so a jumping box cannot yank the rig.
+
+    The commanded angle accumulates continuously. A pulse is only rewritten
+    when its width actually changes, so a target at rest does not keep
+    restarting the PWM.
+
+    Two output backends:
+
+      hwpwm  Hardware PWM through /sys/class/pwm (the default). The pulses
+             come from the epwm peripheral, so a busy CPU cannot bend them.
+             Needs the servo signals on PWM capable pins and the matching
+             overlay, e.g. pwm-epwm1-gpio6-gpio13.dtbo.
+      lgpio  Software PWM on any GPIO. lgpio times the pulses from its own
+             thread; a pulse 100 us late is a ~9 degree twitch, and this
+             process keeps the CPU busy, so that thread is started with
+             real-time priority (see _init_lgpio). Still jitters under load.
+    """
+
+    def __init__(
+        self,
+        backend="hwpwm",
+        pwm_device="23010000.pwm",  # epwm1
+        pan_pwm_channel=1,   # GPIO13, header pin 33
+        tilt_pwm_channel=0,  # GPIO6, header pin 31
+        pan_chip=3,          # lgpio: GPIO17
+        pan_line=8,
+        tilt_chip=2,         # lgpio: GPIO27
+        tilt_line=33,
+        deadzone=0.03,       # Error (normalized) that counts as centred
+        gain=0.10,           # Fraction of the error corrected per frame
+        max_step=1.5,        # Largest single move, degrees per frame
+        smoothing=0.3,       # EMA on the error (0.0 = raw, 1.0 = frozen)
+        hfov=40.0,           # Horizontal camera field of view, degrees
+        vfov=23.0,           # Vertical camera field of view, degrees
+        release_after=0.0,   # Cut pulses after this many seconds at rest, 0 = never
+        rt_priority=70,      # SCHED_FIFO priority of the pulse thread, 0 = off
+        pan_range=(-90.0, 90.0),
+        tilt_range=(-50.0, 50.0),
+        pan_invert=False,
+        tilt_invert=False,
+        search=True,         # Sweep the pan axis while no target is seen
+        search_delay=1.0,    # Seconds without a target before sweeping
+        search_step=10.0,    # Degrees per hop of the stop-and-go sweep
+        search_dwell=0.8,    # Seconds to stand still after each hop
+        search_pan=(-60.0, 60.0),  # Sweep limits, degrees
+        search_tilt=0.0,     # Tilt angle held while sweeping
+    ):
+        self.backend = backend
+        self.pwm_device = pwm_device
+        self.pan_pwm_channel = pan_pwm_channel
+        self.tilt_pwm_channel = tilt_pwm_channel
+        self.pan_chip = pan_chip
+        self.pan_line = pan_line
+        self.tilt_chip = tilt_chip
+        self.tilt_line = tilt_line
+        self.deadzone = deadzone
+        self.gain = gain
+        self.max_step = max_step
+        self.smoothing = smoothing
+        self.half_hfov = hfov / 2.0
+        self.half_vfov = vfov / 2.0
+        self.release_after = release_after
+        self.rt_priority = rt_priority
+        self.pan_range = pan_range
+        self.tilt_range = tilt_range
+        self.pan_invert = pan_invert
+        self.tilt_invert = tilt_invert
+        self.search_enabled = search
+        self.search_delay = search_delay
+        self.search_step = search_step
+        self.search_dwell = search_dwell
+        self.search_pan = (min(search_pan), max(search_pan))
+        self.search_tilt = search_tilt
+
+        # Sweep state. search_dir is +1/-1 in pan angle, and is pointed by
+        # update() towards the side the target was last seen on, so a target
+        # that walks out of the frame is looked for where it went first.
+        self.searching = False
+        self.search_dir = 1.0
+        self.last_target_time = 0.0
+        self.next_hop_time = None
+
+        self.pan_angle = 0.0
+        self.tilt_angle = 0.0
+        # Last pulse width written to each line. idle() silences the lines
+        # but keeps these, so a line only wakes up when its angle changes.
+        self.pan_pw = None
+        self.tilt_pw = None
+        self.pulsing = False
+
+        # Filtrelenmiş hata
+        self.smooth_dx = 0.0
+        self.smooth_dy = 0.0
+
+        self.last_move_time = 0.0
+
+        self.pan_out = None
+        self.tilt_out = None
+        self.enabled = False
+
+        self._init_servos()
+
+    def _angle_to_pw(self, angle):
+        """Map angle in degrees to pulse width in microseconds (500 to 2500 us)."""
+        pw = 1500.0 + (angle / 90.0) * 1000.0
+        return max(500, min(2500, int(round(pw))))
+
+    def _init_servos(self):
+        import time
+
+        try:
+            if self.backend == "hwpwm":
+                self.pan_out = _SysfsPwmServo(self.pwm_device, self.pan_pwm_channel)
+                self.tilt_out = _SysfsPwmServo(self.pwm_device, self.tilt_pwm_channel)
+                rt = None
+            elif self.backend == "lgpio":
+                rt = self._init_lgpio()
+            else:
+                raise ValueError("unknown servo_backend '%s'" % self.backend)
+
+            # Başlangıçta 0'a al
+            self.enabled = True
+            self._send(0.0, 0.0)
+            time.sleep(0.4)
+            self.last_move_time = time.time()
+            print(
+                "[INFO] Pan-Tilt Servos initialized (%s, gain=%.2f "
+                "deadzone=%.2f fov=%.0fx%.0f%s)."
+                % (self.backend, self.gain, self.deadzone, self.half_hfov * 2,
+                   self.half_vfov * 2,
+                   "" if rt is None else " rt=" + ("on" if rt else "off"))
+            )
+        except Exception as exc:
+            self.enabled = False
+            print(
+                "[ERROR] Pan-Tilt Servo initialization failed: %s" % exc
+            )
+
+    def _init_lgpio(self):
+        """Open the lgpio lines. Returns whether the pulse thread got RT."""
+        import os
+
+        # lgpio starts its pulse thread from whichever thread first opens a
+        # chip or sends a pulse, and the new thread inherits that thread's
+        # scheduling policy. Switch to SCHED_FIFO for exactly that window and
+        # back to normal afterwards, so only the pulse thread ends up
+        # real-time and the rest of the app (numpy, GStreamer) stays as it was.
+        rt = False
+        if self.rt_priority > 0:
+            try:
+                os.sched_setscheduler(
+                    0, os.SCHED_FIFO, os.sched_param(self.rt_priority)
+                )
+                rt = True
+            except (AttributeError, OSError) as exc:
+                print("[WARNING] Servo pulse thread stays non-RT: %s" % exc)
+
+        try:
+            import lgpio
+
+            pan_handle = lgpio.gpiochip_open(self.pan_chip)
+            tilt_handle = (
+                pan_handle
+                if self.tilt_chip == self.pan_chip
+                else lgpio.gpiochip_open(self.tilt_chip)
+            )
+            self.pan_out = _LgpioServo(lgpio, pan_handle, self.pan_line)
+            self.tilt_out = _LgpioServo(lgpio, tilt_handle, self.tilt_line)
+            # The first pulse is what starts the thread, keep it in the window.
+            self.pan_out.write(1500)
+            self.tilt_out.write(1500)
+        finally:
+            if rt:
+                os.sched_setscheduler(0, os.SCHED_OTHER, os.sched_param(0))
+        return rt
+
+    def _send(self, pan_angle, tilt_angle):
+        """Write both angles, touching a line only if its pulse changed."""
+        moved = False
+        pan_pw = self._angle_to_pw(pan_angle)
+        if pan_pw != self.pan_pw:
+            try:
+                self.pan_out.write(pan_pw)
+                self.pan_pw = pan_pw
+                self.pulsing = moved = True
+            except Exception:
+                pass
+        tilt_pw = self._angle_to_pw(tilt_angle)
+        if tilt_pw != self.tilt_pw:
+            try:
+                self.tilt_out.write(tilt_pw)
+                self.tilt_pw = tilt_pw
+                self.pulsing = moved = True
+            except Exception:
+                pass
+        return moved
+
+    def _step(self, error, half_fov):
+        """Degrees to move for a normalized error, 0 inside the deadzone."""
+        if abs(error) <= self.deadzone:
+            return 0.0
+        step = self.gain * error * half_fov
+        return max(-self.max_step, min(self.max_step, step))
+
+    def update(self, raw_dx, raw_dy):
+        """One control step towards the target at (raw_dx, raw_dy)."""
+        import time
+
+        if not self.enabled:
+            return
+
+        now = time.time()
+        self.last_target_time = now
+        self.searching = False
+        self.next_hop_time = None
+        if abs(raw_dx) > self.deadzone:
+            # The pan angle moves this way to follow a target on this side,
+            # see the pan step below.
+            toward = -1.0 if raw_dx > 0 else 1.0
+            self.search_dir = -toward if self.pan_invert else toward
+
+        # Düşük geçiren filtre (kutu titreşimini süzer). Kept light: every bit
+        # of smoothing is extra delay inside the loop.
+        self.smooth_dx = (
+            self.smoothing * self.smooth_dx + (1.0 - self.smoothing) * raw_dx
+        )
+        self.smooth_dy = (
+            self.smoothing * self.smooth_dy + (1.0 - self.smoothing) * raw_dy
+        )
+
+        # 1. PAN (Yatay Takip). Target right of centre (dx > 0) lowers the
+        # angle unless inverted.
+        delta_pan = self._step(self.smooth_dx, self.half_hfov)
+        if self.pan_invert:
+            delta_pan = -delta_pan
+        self.pan_angle = max(
+            self.pan_range[0], min(self.pan_range[1], self.pan_angle - delta_pan)
+        )
+
+        # 2. TILT (Dikey Takip). Target below centre (dy > 0) lowers the
+        # angle unless inverted.
+        delta_tilt = self._step(self.smooth_dy, self.half_vfov)
+        if self.tilt_invert:
+            delta_tilt = -delta_tilt
+        self.tilt_angle = max(
+            self.tilt_range[0],
+            min(self.tilt_range[1], self.tilt_angle - delta_tilt),
+        )
+
+        if self._send(self.pan_angle, self.tilt_angle):
+            self.last_move_time = now
+        elif 0 < self.release_after < now - self.last_move_time:
+            # Hedef merkezlendi: Sessiz bekleme
+            self.idle()
+
+    def search(self):
+        """
+        No target: hold for search_delay, then sweep the pan axis between the
+        search_pan limits in hops, while tilt goes to search_tilt.
+
+        Stop and go rather than a continuous sweep: indoors the exposure is
+        long, and at 20 deg/s every frame of a moving camera was smeared
+        enough that the face model found nothing even with a face filling
+        the frame. Each hop takes the servo ~0.1 s; the rig then stands still
+        for search_dwell, which at 15 fps is ~12 sharp frames, more than
+        initialization_delay needs to confirm a detection.
+        """
+        import time
+
+        if not self.enabled:
+            return
+        now = time.time()
+        if not self.search_enabled or now - self.last_target_time < self.search_delay:
+            self.hold()
+            return
+
+        self.searching = True
+        if self.next_hop_time is not None and now < self.next_hop_time:
+            return
+        self.next_hop_time = now + self.search_dwell
+
+        lo, hi = self.search_pan
+        pan = self.pan_angle + self.search_dir * self.search_step
+        if pan >= hi:
+            pan, self.search_dir = hi, -1.0
+        elif pan <= lo:
+            pan, self.search_dir = lo, 1.0
+        self.pan_angle = max(self.pan_range[0], min(self.pan_range[1], pan))
+        self.tilt_angle = self.search_tilt
+
+        if self._send(self.pan_angle, self.tilt_angle):
+            self.last_move_time = now
+
+    # Fire recoil: (right, up) degrees applied on consecutive frames. Kick up
+    # and shake sideways, then settle back; each column sums to zero, so the
+    # camera ends where it started.
+    RECOIL = ((1.5, 5.0), (-3.0, -1.5), (2.0, -1.5), (-0.5, -1.2), (0.0, -0.8))
+
+    def recoil(self):
+        self.recoil_steps = list(self.RECOIL)
+
+    def step_recoil(self):
+        """Apply the next recoil step; True while a recoil is running."""
+        steps = getattr(self, "recoil_steps", None)
+        if not steps:
+            return False
+        right, up = steps.pop(0)
+        self.nudge(right, up)
+        return True
+
+    def nudge(self, right_deg, up_deg):
+        """
+        Manual move: turn the view right/up by the given degrees (negative
+        for left/down), with the same signs update() uses to follow a target
+        on that side, so the invert flags apply here too.
+        """
+        import time
+
+        if not self.enabled:
+            return
+        d_pan = right_deg * (-1.0 if self.pan_invert else 1.0)
+        self.pan_angle = max(
+            self.pan_range[0], min(self.pan_range[1], self.pan_angle - d_pan)
+        )
+        d_tilt = -up_deg * (-1.0 if self.tilt_invert else 1.0)
+        self.tilt_angle = max(
+            self.tilt_range[0], min(self.tilt_range[1], self.tilt_angle - d_tilt)
+        )
+        if self._send(self.pan_angle, self.tilt_angle):
+            self.last_move_time = time.time()
+
+    def hold(self):
+        """No target: keep the current angle, go silent once at rest."""
+        import time
+
+        if self.enabled and 0 < self.release_after < time.time() - self.last_move_time:
+            self.idle()
+
+    def idle(self):
+        """Silence pulses to stop buzzing. Keeps current angle."""
+        if not self.enabled or not self.pulsing:
+            return
+        try:
+            self.pan_out.off()
+            self.tilt_out.off()
+            self.pulsing = False
+        except Exception:
+            pass
+
+    def reset_filters(self):
+        """Reset smoothing filters when acquiring a new target."""
+        self.smooth_dx = 0.0
+        self.smooth_dy = 0.0
+
+    def close(self):
+        if not self.enabled:
+            return
+        for out in (self.pan_out, self.tilt_out):
+            try:
+                out.close()
+            except Exception:
+                pass
+
+
+class _SysfsPwmServo:
+    """One servo on a hardware PWM channel, via /sys/class/pwm."""
+
+    PERIOD_NS = 20000000  # 50 Hz
+
+    def __init__(self, device, channel):
+        import glob
+        import os
+        import time
+
+        # pwmchipN numbers follow probe order, so find the chip by the
+        # address of the peripheral instead.
+        chips = [
+            c for c in glob.glob("/sys/class/pwm/pwmchip*")
+            if os.path.basename(os.path.realpath(c + "/device")) == device
+        ]
+        if not chips:
+            raise RuntimeError("no pwmchip for %s" % device)
+        self.path = "%s/pwm%d" % (chips[0], channel)
+        if not os.path.isdir(self.path):
+            self._put(chips[0] + "/export", channel)
+            # udev may still be fixing up the new directory.
+            for _ in range(50):
+                if os.access(self.path + "/period", os.W_OK):
+                    break
+                time.sleep(0.01)
+        self._put("enable", 0)
+        # duty_cycle may not exceed period, so clear it before the period.
+        self._put("duty_cycle", 0)
+        self._put("period", self.PERIOD_NS)
+        self.enabled = False
+
+    def _put(self, name, value):
+        path = name if name.startswith("/") else "%s/%s" % (self.path, name)
+        with open(path, "w") as f:
+            f.write(str(value))
+
+    def write(self, pw_us):
+        self._put("duty_cycle", int(pw_us) * 1000)
+        if not self.enabled:
+            self._put("enable", 1)
+            self.enabled = True
+
+    def off(self):
+        self._put("enable", 0)
+        self.enabled = False
+
+    def close(self):
+        self.off()
+
+
+class _LgpioServo:
+    """One servo on any GPIO, software PWM through lgpio."""
+
+    def __init__(self, lgpio, handle, line):
+        self.lgpio = lgpio
+        self.handle = handle
+        self.line = line
+        try:
+            lgpio.gpio_claim_output(handle, line)
+        except Exception:
+            pass
+
+    def write(self, pw_us):
+        self.lgpio.tx_servo(self.handle, self.line, int(pw_us), 50)
+
+    def off(self):
+        self.lgpio.tx_servo(self.handle, self.line, 0)
+
+    def close(self):
+        self.off()
+        try:
+            self.lgpio.gpiochip_close(self.handle)
+        except Exception:
+            pass
+
+
 class PostProcessTracking(PostProcess):
     """
     Post process for detection models that adds Norfair based multi object
@@ -573,6 +1032,14 @@ class PostProcessTracking(PostProcess):
     # when re-acquiring. Large enough to survive a rename, small enough not to
     # jump to a different object across the room.
     LOCK_REACQUIRE_RADIUS = 0.25
+
+    # How many frames after a lock is lost the last target position still
+    # decides who gets the next lock. A fast pan blurs the target for a few
+    # frames, its id dies and the new one needs initialization_delay frames;
+    # without this memory the next lock went to whoever was closest to the
+    # frame centre, which with two people in view is not necessarily the one
+    # just followed.
+    LOCK_MEMORY_FRAMES = 30
 
     # hybrid: frames between detector corrections, and the IoU below which a
     # correction is treated as "the visual tracker is on the wrong thing".
@@ -678,6 +1145,8 @@ class PostProcessTracking(PostProcess):
         # Last known target box in frame pixels, [x1, y1, x2, y2]. Kept even
         # while the lock is lost so re-acquisition has something to aim at.
         self.locked_box = None
+        # Frame the lock was last lost on, for LOCK_MEMORY_FRAMES.
+        self.lock_lost_frame = None
         # Human readable state, drawn in the badge and used by report().
         self.state = "SEARCHING"
 
@@ -720,6 +1189,145 @@ class PostProcessTracking(PostProcess):
 
         self.frame_count = 0
         self._reported_ids = set()
+
+        # Local panel through the framebuffer, see fb_view.py. "" turns it off.
+        self.fb_view = None
+        fb_dev = str(getattr(self.model, "display_fb", ""))
+        if fb_dev:
+            try:
+                from fb_view import FbView
+
+                self.fb_view = FbView(
+                    device=fb_dev, rotate=int(getattr(self.model, "display_rotate", 90))
+                )
+            except Exception as exc:
+                print("[WARNING] Panel view disabled: %s" % exc)
+
+        # Touch on the panel: tap a tracked object to lock onto it, tap
+        # anywhere else to drop the lock and let lock_policy pick again. The
+        # tap arrives on the touch thread and is only recorded here; the next
+        # frame acts on it in update_lock(). "" turns it off.
+        self.touch_request = None
+        self.touch_marker = None
+        self.touch = None
+        self.ui = None
+        self.manual_speed = float(getattr(self.model, "servo_manual_speed", 30.0))
+        # Picture style, see hud.py. The panel's effect buttons override it.
+        from hud import Hud, STYLES
+
+        self.hud = Hud()
+        self.hud_style = str(getattr(self.model, "hud_style", "aim")).lower()
+        if self.hud_style not in STYLES:
+            print("[WARNING] Unknown hud_style '%s', using aim." % self.hud_style)
+            self.hud_style = "aim"
+        self._manual_time = None
+        self._all_tracked = []
+        # Fire button state: frame of the last shot, its result, the score.
+        self.fire_frame = None
+        self.fire_hit = False
+        self.fire_point = None
+        self.score = 0
+        touch_dev = str(getattr(self.model, "display_touch", "auto"))
+        if self.fb_view and touch_dev:
+            try:
+                from touch_input import TouchInput
+
+                from panel_ui import PanelUI
+
+                def on_picture_tap(px, py):
+                    pt = self.fb_view.panel_to_frame(px, py)
+                    if pt is not None:
+                        self.touch_request = pt
+                        self.touch_marker = (pt, self.frame_count)
+
+                self.ui = PanelUI(
+                    self.fb_view.width, self.fb_view.height, on_picture_tap,
+                    effect=self.hud_style,
+                )
+                self.fb_view.ui = self.ui
+                self.fb_view.filter = lambda f: self.hud.filter(f, self.ui.effect)
+                self.touch = TouchInput(
+                    self.ui.down, self.ui.up, device=touch_dev
+                )
+            except Exception as exc:
+                print("[WARNING] Touch input disabled: %s" % exc)
+
+        # Browser view of the drawn frames, see web_view.py. 0 turns it off.
+        self.web_view = None
+        web_port = int(getattr(self.model, "web_view_port", 8080))
+        if web_port:
+            try:
+                from web_view import WebView
+
+                self.web_view = WebView(port=web_port)
+            except Exception as exc:
+                print("[WARNING] Web view disabled: %s" % exc)
+
+        # ------------------------------------------------------------------
+        # Pan-Tilt Servo Controller (hwpwm: GPIO13 pan, GPIO6 tilt)
+        # ------------------------------------------------------------------
+        pan_chip = int(getattr(m, "servo_pan_chip", 3))
+        pan_line = int(getattr(m, "servo_pan_line", 8))
+        tilt_chip = int(getattr(m, "servo_tilt_chip", 2))
+        tilt_line = int(getattr(m, "servo_tilt_line", 33))
+        pan_invert = bool(getattr(m, "servo_pan_invert", False))
+        tilt_invert = bool(getattr(m, "servo_tilt_invert", False))
+        # Where inside the box to aim, as a fraction of its height from the
+        # top. 0.5 is the centre; for a person something like 0.15 puts the
+        # head, not the chest, in the middle of the frame. A person close to
+        # the camera fills the whole frame height, so the box centre sits on
+        # the frame centre and would never move the tilt axis at all.
+        self.servo_aim_y = float(getattr(m, "servo_aim_y", 0.5))
+        # One line per frame while locked: detection score, live flag, error
+        # and the commanded angles. For tuning; off by default.
+        self.servo_debug = bool(getattr(m, "servo_debug", False))
+
+        # Camera motion compensation. The camera rides on the servos, so every
+        # pan step shifts the whole picture (~32 px per degree), and Norfair's
+        # Kalman filter learned that shift as the target's own velocity. When
+        # a detection then dropped out the prediction flew off in the
+        # direction of the last pan move, the next detection no longer matched
+        # it, and the lock was lost after one or two seconds every time.
+        # Tracking in "world" coordinates (image position plus where the
+        # servos point) removes the shift. The picture lags the command, so
+        # the angle from servo_motion_delay frames ago is the one that
+        # belongs to the current frame.
+        from collections import deque
+        from norfair.camera_motion import TranslationTransformation
+
+        self.TranslationTransformation = TranslationTransformation
+        self.motion_delay = max(0, int(getattr(m, "servo_motion_delay", 2)))
+        self.angle_history = deque(maxlen=self.motion_delay + 1)
+        self.motion_compensation = bool(getattr(m, "servo_motion_compensation", True))
+
+        self.servo_controller = PanTiltServoController(
+            backend=str(getattr(m, "servo_backend", "hwpwm")).lower(),
+            pwm_device=str(getattr(m, "servo_pwm_device", "23010000.pwm")),
+            pan_pwm_channel=int(getattr(m, "servo_pan_pwm_channel", 1)),
+            tilt_pwm_channel=int(getattr(m, "servo_tilt_pwm_channel", 0)),
+            pan_chip=pan_chip,
+            pan_line=pan_line,
+            tilt_chip=tilt_chip,
+            tilt_line=tilt_line,
+            deadzone=float(getattr(m, "servo_deadzone", 0.03)),
+            gain=float(getattr(m, "servo_gain", 0.10)),
+            max_step=float(getattr(m, "servo_max_step", 1.5)),
+            smoothing=float(getattr(m, "servo_smoothing", 0.3)),
+            hfov=float(getattr(m, "servo_hfov", 40.0)),
+            vfov=float(getattr(m, "servo_vfov", 23.0)),
+            release_after=float(getattr(m, "servo_release_after", 0.0)),
+            rt_priority=int(getattr(m, "servo_rt_priority", 70)),
+            pan_invert=pan_invert,
+            tilt_invert=tilt_invert,
+            search=bool(getattr(m, "servo_search", True)),
+            search_delay=float(getattr(m, "servo_search_delay", 1.0)),
+            search_step=float(getattr(m, "servo_search_step", 10.0)),
+            search_dwell=float(getattr(m, "servo_search_dwell", 0.8)),
+            search_pan=tuple(
+                float(a) for a in getattr(m, "servo_search_pan", (-60.0, 60.0))
+            ),
+            search_tilt=float(getattr(m, "servo_search_tilt", 0.0)),
+        )
 
     def get_track_class_names(self):
         """
@@ -837,8 +1445,11 @@ class PostProcessTracking(PostProcess):
             ]
 
         if not self.model.normalized_detections:
-            bbox[..., (0, 2)] /= self.model.resize[0]
-            bbox[..., (1, 3)] /= self.model.resize[1]
+            # With a letterboxed input the image only fills letterbox_size of
+            # the model input (top left), so normalise against that.
+            norm = getattr(self.model, "letterbox_size", None) or self.model.resize
+            bbox[..., (0, 2)] /= norm[0]
+            bbox[..., (1, 3)] /= norm[1]
 
         # ------------------------------------------------------------------
         # OBJECT TRACKING
@@ -851,6 +1462,12 @@ class PostProcessTracking(PostProcess):
 
         self.frame_count += 1
 
+        # Detections that exist in THIS frame, by identity. A Norfair object
+        # whose last_detection is not among them is coasting on its Kalman
+        # prediction; see update_pan_tilt(). None means every object is live
+        # (hybrid, whose visual tracker measures the target every frame).
+        self._live_detections = None
+
         if self.track_mode == self.MODE_HYBRID:
             # The detector is only consulted on correction frames, so bbox is
             # decoded above but usually thrown away. That waste is deliberate:
@@ -861,8 +1478,13 @@ class PostProcessTracking(PostProcess):
             tracked_objects = self.update_hybrid(img, bbox)
         else:
             detections = self.yolo_detections_to_norfair_detections(bbox)
-            tracked_objects = self.tracker.update(detections=detections)
+            self._live_detections = set(id(d) for d in detections)
+            tracked_objects = self.tracker.update(
+                detections=detections,
+                coord_transformations=self.camera_motion(img.shape[1], img.shape[0]),
+            )
             if self.track_mode == self.MODE_LOCK:
+                self._all_tracked = tracked_objects
                 tracked_objects = self.update_lock(tracked_objects, img)
             else:
                 self.state = (
@@ -871,14 +1493,95 @@ class PostProcessTracking(PostProcess):
                     else "SEARCHING"
                 )
 
+        self._last_tracked = tracked_objects
         self.update_tracked_positions(tracked_objects, img.shape[1], img.shape[0])
         self.report_tracked_positions()
+        self.update_pan_tilt(img.shape[1], img.shape[0])
+        if self.servo_controller and self.servo_controller.enabled:
+            self.angle_history.append(
+                (self.servo_controller.pan_angle, self.servo_controller.tilt_angle)
+            )
 
-        img = self.pathd.draw(img, tracked_objects)
-        self.draw_tracked_objects(img, tracked_objects)
+        style = self.ui.effect if self.ui is not None else self.hud_style
 
-        if self.SHOW_STATUS_BADGE:
-            self.draw_status_badge(img)
+        # Fire: a hit when the locked target's centre is near the crosshair.
+        if self.ui is not None and self.ui.fire_request:
+            self.ui.fire_request = False
+            if self.fire_frame is None or self.frame_count - self.fire_frame >= 8:
+                self.fire_frame = self.frame_count
+                self.fire_hit, self.fire_point = False, None
+                if self.state.startswith("LOCKED") and tracked_objects:
+                    x1, y1, x2, y2 = self.box_of(tracked_objects[0])
+                    tx, ty = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                    self.fire_point = (int(tx), int(ty))
+                    half = max(abs(x2 - x1), abs(y2 - y1)) / 2.0
+                    dist = ((tx - img.shape[1] / 2.0) ** 2 + (ty - img.shape[0] / 2.0) ** 2) ** 0.5
+                    self.fire_hit = dist <= max(60.0, half)
+                if self.fire_hit:
+                    self.score += 1
+                if self.servo_controller and self.servo_controller.enabled:
+                    self.servo_controller.recoil()
+                print("[f:%d] ! fire: %s (score %d)" % (
+                    self.frame_count, "hit" if self.fire_hit else "miss", self.score), flush=True)
+        locked_ids = set(o.id for o in tracked_objects)
+        others = [
+            self.box_of(o) for o in self._all_tracked if o.id not in locked_ids
+        ] if self.track_mode == self.MODE_LOCK else []
+
+        if style == "plain":
+            img = self.pathd.draw(img, tracked_objects)
+            # The other candidates, thin and grey, so there is something to
+            # tap on the panel to move the lock to another person.
+            for box in others:
+                x1, y1, x2, y2 = (int(v) for v in box)
+                cv2.rectangle(img, (x1, y1), (x2, y2), (200, 200, 200), 2)
+            self.draw_tracked_objects(img, tracked_objects)
+            if self.SHOW_STATUS_BADGE:
+                self.draw_status_badge(img)
+        else:
+            # The night / thermal colouring is done by the panel writer
+            # thread (fb_view.filter), so web and RTP show the HUD over the
+            # normal picture and the pipeline does not pay for it.
+            locked = None
+            if self.state.startswith("LOCKED") and tracked_objects:
+                obj = tracked_objects[0]
+                det = getattr(obj, "last_detection", None)
+                score = float(det.scores[0]) if det is not None and det.scores is not None else None
+                locked = (self.box_of(obj), obj.id, score)
+            sc = self.servo_controller
+            try:
+                self.hud.draw(
+                    img, style, self.frame_count, locked, others, self.state,
+                    sc.pan_angle if sc else 0.0, sc.tilt_angle if sc else 0.0,
+                    self.ui is not None and self.ui.manual,
+                    bool(sc and sc.searching),
+                )
+            except Exception as exc:
+                # Decoration only: never let a drawing bug stop tracking.
+                print("[WARNING] HUD draw failed: %s" % exc, flush=True)
+
+        if self.fire_frame is not None:
+            try:
+                self.hud.draw_fire(
+                    img, self.frame_count - self.fire_frame, self.fire_hit,
+                    self.fire_point, self.score,
+                )
+            except Exception as exc:
+                print("[WARNING] fire effect failed: %s" % exc, flush=True)
+
+        # Where the last tap landed, for about half a second, so a tap that
+        # misses the box is visible on the panel as a miss.
+        if self.touch_marker is not None:
+            (mx, my), f0 = self.touch_marker
+            if self.frame_count - f0 <= 8:
+                cv2.circle(img, (int(mx), int(my)), 28, (255, 220, 0), 4)
+            else:
+                self.touch_marker = None
+
+        if self.web_view:
+            self.web_view.publish(img)
+        if self.fb_view:
+            self.fb_view.publish(img)
 
         if self.debug:
             self.debug.log(self.debug_str)
@@ -961,6 +1664,40 @@ class PostProcessTracking(PostProcess):
 
         by_id = {obj.id: obj for obj in tracked_objects}
 
+        # A tap on the panel since the last frame. On an object: lock onto
+        # it, whatever lock_policy would have picked. Off every object: drop
+        # the lock and its memory, so the automatic pick below starts over.
+        req, self.touch_request = self.touch_request, None
+        if req is not None:
+            tx, ty = req
+            hits = [
+                (obj, box)
+                for obj, box in ((o, self.box_of(o)) for o in tracked_objects)
+                if box[0] <= tx <= box[2] and box[1] <= ty <= box[3]
+            ]
+            if hits:
+                # The smallest box under the finger, a face in front of a body.
+                obj, box = min(
+                    hits, key=lambda ob: (ob[1][2] - ob[1][0]) * (ob[1][3] - ob[1][1])
+                )
+                print("[f:%d] * touch lock id=%d" % (self.frame_count, obj.id))
+                if self.ui is not None:
+                    self.ui.manual = False
+                self.locked_id = obj.id
+                self.locked_box = box
+                self.lock_lost_frame = None
+                self.state = "LOCKED id=%d" % obj.id
+                return [obj]
+            print(
+                "[f:%d] - touch release (id=%s) at (%d,%d), boxes %s"
+                % (self.frame_count, self.locked_id, tx, ty,
+                   [[int(v) for v in b] for _, b in
+                    ((o, self.box_of(o)) for o in tracked_objects)])
+            )
+            self.locked_id = None
+            self.locked_box = None
+            self.lock_lost_frame = None
+
         # Still holding the same id: nothing to decide.
         if self.locked_id is not None and self.locked_id in by_id:
             obj = by_id[self.locked_id]
@@ -972,7 +1709,15 @@ class PostProcessTracking(PostProcess):
 
         # Lost the id. Try to inherit the lock from whatever is nearest the
         # last known position before falling back to a fresh pick.
-        if self.locked_id is not None and self.locked_box is not None and candidates:
+        recently_lost = (
+            self.lock_lost_frame is not None
+            and self.frame_count - self.lock_lost_frame <= self.LOCK_MEMORY_FRAMES
+        )
+        if (
+            (self.locked_id is not None or recently_lost)
+            and self.locked_box is not None
+            and candidates
+        ):
             lcx, lcy = self.box_center(self.locked_box)
             diag = (frame_w ** 2 + frame_h ** 2) ** 0.5
             limit = self.LOCK_REACQUIRE_RADIUS * diag
@@ -1000,6 +1745,7 @@ class PostProcessTracking(PostProcess):
                 print("[f:%d] - lock lost (id=%s)"
                       % (self.frame_count, self.locked_id))
                 self.locked_id = None
+                self.lock_lost_frame = self.frame_count
             self.state = "SEARCHING"
             return []
 
@@ -1227,6 +1973,126 @@ class PostProcessTracking(PostProcess):
 
         return [VisualTrack(box, self.locked_id, self.hybrid_age)]
 
+    def camera_motion(self, frame_w, frame_h):
+        """
+        Norfair coordinate transformation for where the camera pointed when
+        this frame was taken, or None without servos.
+
+        The sign follows the controller: moving an axis the way update() does
+        for a target on the positive side brings that target towards the
+        centre, i.e. shifts the picture towards negative x (or y). So the
+        world position is the image position plus angle * sign * px/degree,
+        and Norfair wants movement_vector = relative - absolute.
+        """
+        sc = self.servo_controller
+        if not self.motion_compensation or not sc or not sc.enabled:
+            return None
+        if self.angle_history:
+            pan, tilt = self.angle_history[0]
+        else:
+            pan, tilt = sc.pan_angle, sc.tilt_angle
+        sign_pan = 1.0 if sc.pan_invert else -1.0
+        sign_tilt = 1.0 if sc.tilt_invert else -1.0
+        px_deg_x = frame_w / (2.0 * sc.half_hfov)
+        px_deg_y = frame_h / (2.0 * sc.half_vfov)
+        return self.TranslationTransformation(
+            np.array(
+                [-pan * sign_pan * px_deg_x, -tilt * sign_tilt * px_deg_y]
+            )
+        )
+
+    def debug_servo_line(self, dy):
+        sc = self.servo_controller
+        p = self.tracked_positions[0] if self.tracked_positions else None
+        score = None
+        if p is not None and self._live_detections is not None:
+            for obj in self._last_tracked:
+                if obj.id == p["id"] and obj.last_detection is not None:
+                    score = float(obj.last_detection.scores[0])
+        print(
+            "[SERVO] f=%d %s live=%s score=%s dx=%s dy=%s pan=%.1f tilt=%.1f"
+            % (
+                self.frame_count,
+                self.state,
+                None if p is None else p["live"],
+                "-" if score is None else "%.2f" % score,
+                "-" if p is None else "%+.2f" % p["dx"],
+                "-" if dy is None else "%+.2f" % dy,
+                sc.pan_angle,
+                sc.tilt_angle,
+            ),
+            flush=True,
+        )
+
+    def update_pan_tilt(self, frame_w, frame_h):
+        """
+        Drive the pan-tilt mechanism towards the tracked/locked target.
+        - When LOCKED: Smoothly track the target.
+        - When LOCKED but the target is only predicted this frame: hold still.
+        - When SEARCHING (target lost): hold for servo_search_delay, then sweep
+          the pan axis until something is locked again (see search()).
+        """
+        if not self.servo_controller or not self.servo_controller.enabled:
+            return
+
+        # Recoil after a shot runs on top of whatever mode is active.
+        self.servo_controller.step_recoil()
+
+        if self.ui is not None and self.ui.manual:
+            # MANUAL: the D-pad drives the servos, nothing else does.
+            import time
+
+            now = time.time()
+            dt = 0.0 if self._manual_time is None else min(0.2, now - self._manual_time)
+            self._manual_time = now
+            right, up = self.ui.move
+            if right or up:
+                step = self.manual_speed * dt
+                self.servo_controller.nudge(right * step, up * step)
+            self.servo_controller.searching = False
+            # Returning to AUTO should look around from here, not jump
+            # straight into a sweep.
+            self.servo_controller.last_target_time = now
+            self.servo_controller.reset_filters()
+            return
+        self._manual_time = None
+
+        is_locked = self.state.startswith("LOCKED")
+        dy = None
+
+        if is_locked and self.tracked_positions and not self.tracked_positions[0]["live"]:
+            # Locked, but the target was not detected in this frame and its box
+            # is only the Kalman prediction. Hold still instead of steering
+            # after it: a prediction keeps its last velocity, and with the
+            # camera itself moving it ran off the frame edge (dx -1.42 in the
+            # log) and swung the rig away from where the target reappeared.
+            # The filters are kept, this is a brief occlusion, not a new
+            # target.
+            self.servo_controller.hold()
+        elif is_locked and self.tracked_positions:
+            target = self.tracked_positions[0]
+            x1, y1, x2, y2 = target["bbox"]
+            margin = 0.02 * frame_h
+            if y1 <= margin and y2 >= frame_h - margin:
+                # The box runs off the top AND the bottom of the frame: the
+                # person is close enough to fill it, and where servo_aim_y
+                # lands in the real body is unknown. Aiming at it anyway
+                # always reads "above centre", since the box never shrinks
+                # however far the camera tilts, and drove tilt into its
+                # end stop. Leave tilt alone until the box fits.
+                dy = 0.0
+            else:
+                aim_y = y1 + self.servo_aim_y * (y2 - y1)
+                dy = (aim_y - frame_h / 2.0) / (frame_h / 2.0)
+            self.servo_controller.update(target["dx"], dy)
+        else:
+            # No target: hold briefly where it was lost, then sweep for it.
+            self.servo_controller.search()
+            self.servo_controller.reset_filters()
+
+        if self.servo_debug and is_locked:
+            self.debug_servo_line(dy)
+
     def draw_status_badge(self, frame):
         """
         Draw the current state in the top left corner.
@@ -1237,6 +2103,15 @@ class PostProcessTracking(PostProcess):
         once at startup instead, where it belongs.
         """
         label = self.state
+        if self.ui is not None and self.ui.manual:
+            label = "MANUEL | " + label
+        if self.servo_controller and self.servo_controller.searching:
+            label += " (scan)"
+        if self.servo_controller and self.servo_controller.enabled:
+            label += " | Pan:%+.0f Tilt:%+.0f" % (
+                self.servo_controller.pan_angle,
+                self.servo_controller.tilt_angle,
+            )
 
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_size = 0.6
@@ -1316,9 +2191,14 @@ class PostProcessTracking(PostProcess):
             cx = (x1 + x2) / 2.0
             cy = (y1 + y2) / 2.0
 
+            live = self._live_detections is None or (
+                id(getattr(obj, "last_detection", None)) in self._live_detections
+            )
+
             positions.append(
                 {
                     "id": int(obj.id),
+                    "live": live,
                     "dx": (cx - half_w) / half_w,
                     "dy": (cy - half_h) / half_h,
                     "bbox": [int(x1), int(y1), int(x2), int(y2)],

@@ -1070,6 +1070,24 @@ def get_output_elements(output):
             )
             sys.exit()
 
+        """
+        udpsink blocks in sendto() while the receiver's ARP entry is
+        unresolved (receiver switched off, or off the Wi-Fi): the kernel holds
+        the datagrams against the socket until ARP gives up, ~3 s at a time.
+        With appsrc block=True that stall reached all the way back into the
+        tracking loop and froze detection and the servos along with it. A
+        leaky queue in front of udpsink keeps the stall on the network side:
+        when it fills, the oldest packets are dropped and upstream never
+        waits.
+        """
+        property = {
+            "leaky": 2,
+            "max-size-buffers": 0,
+            "max-size-bytes": 0,
+            "max-size-time": 200000000,
+        }
+        sink_elements += make_element("queue", property=property)
+
         property = {
             "host": output.host,
             "port": output.port,
