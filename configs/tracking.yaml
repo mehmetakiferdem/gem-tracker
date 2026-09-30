@@ -115,7 +115,31 @@ models:
         #   first              the first in the list, the cheapest
         lock_policy: closest_to_center
 
+        # Detection to track matching. diou keeps matching a face that moved
+        # more than its own width since the last frame (14 fps, head turn),
+        # where iou gave up and renamed it; tools/sim_tracking.py measured
+        # 6-15 renames per 240 frames with iou at 30-60 px/frame, ~1 with
+        # diou 1.5 and kalman_q 5, and no id swaps between crossing faces.
+        match_distance: diou         # diou | iou (the old behaviour, threshold 1.0)
+        match_threshold: 1.5
+        kalman_q: 5.0                # Kalman process noise: higher learns speed faster
+
+        # Taking a lost lock over: the new box within lock_reacquire_sizes of
+        # the old box's size, and no more than lock_reacquire_scale larger or
+        # smaller, compared in world coordinates while the servos run.
+        lock_reacquire_sizes: 4.0
+        lock_reacquire_scale: 2.0
+
         enable_tracking: True
+
+        # Run inference on both C7x cores, alternate frames on each.
+        # MEASURED with the face model (servos off): 1 core 14.2 fps, 54 ms
+        # per inference; 2 cores 20.0 fps, but 87 ms per inference as the two
+        # share DDR bandwidth. So more updates, each from a slightly older
+        # picture. Left at 1: on the rig the extra latency made the picture
+        # lag and the servos unsteady. With 2 use servo_gain 0.15,
+        # servo_max_step 1.9 and servo_motion_delay 3 (untested on the rig).
+        infer_cores: 1
 
         # Browser view of the output with boxes and badge, MJPEG:
         #   http://192.168.7.2:8080/   over the USB cable
@@ -161,17 +185,36 @@ models:
 
         # Fraction of the error corrected per frame. Higher is faster but
         # starts to overshoot and oscillate (camera latency). 0.08 - 0.15.
-        servo_gain: 0.20             # face model runs ~15 fps; 0.10 at 30 fps
+        servo_gain: 0.20             # per frame: 0.20 at 14 fps (one C7x), 0.15 at 20 fps (two)
         # Largest single move, degrees per frame (1.5 at 30 fps = 45 deg/s).
-        servo_max_step: 2.5          # 37 deg/s at 15 fps; 1.5 could not keep up with a walking person
+        servo_max_step: 2.5          # per frame: 2.5 at 14 fps = 1.9 at 20 fps, ~37 deg/s either way
         # Normalized error treated as centred (0.03 = 3% of half the frame).
         servo_deadzone: 0.03
+        # Hysteresis: once centred (inside servo_deadzone) an axis stays
+        # still until the error passes this; stops the one-step twitching of
+        # a centred target.
+        servo_deadzone_exit: 0.05
+        # servo_gain and servo_max_step are per frame at this frame rate;
+        # the loop scales every step by the real time between frames, so it
+        # behaves the same at 14 or 20 fps (tools/sim_servo.py: at 20 fps the
+        # old per frame loop overshot a 12 degree jump by 3.2 degrees, this
+        # one by 1.2).
+        servo_ref_fps: 14
+        # Velocity feed forward, seconds: the picture is ~0.13 s old, so the
+        # error is moved ahead along the target's own speed (world frame,
+        # camera motion removed). Simulated: tracking error on a swaying
+        # target 3.0 -> 2.3 degrees at 0.08, 1.9 at 0.13. 0 turns it off.
+        servo_lead: 0.10
         # Camera field of view in degrees, turns the error into an angle.
         # IMX219 1920x1080 mode with the stock lens is about 40 x 23.
         servo_hfov: 40
         servo_vfov: 23
         # Log every locked frame ([SERVO] lines): score, live, error, angles.
         servo_debug: False
+        # Frames between a servo command and the first picture that shows it
+        # (capture plus inference, ~130 ms with two cores). 2 at 14 fps with
+        # one core, 3 at 20 fps with two.
+        servo_motion_delay: 2
 
         # Search. With no target the rig first holds still where the target
         # was lost for servo_search_delay seconds, then sweeps the pan axis
@@ -193,9 +236,9 @@ outputs:
         width: 1280
         height: 720
         port: 5000
-        host: 10.0.11.166
+        host: 192.168.200.2         # B (display) board over the mesh
         encoding: h264-rtp
-        bitrate: 4000000
+        bitrate: 2000000
         gop-size: 30
         # overlay-perf-type is left undefined ON PURPOSE. Adding it brings back
         # TI's demo decorations (title, FPS/TEMP readout, bar graphs).

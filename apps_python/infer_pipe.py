@@ -30,6 +30,7 @@
 
 import numpy as np
 from time import time
+import queue
 import threading
 import utils
 import debug
@@ -123,6 +124,125 @@ class InferPipe:
             self.stop_thread = True
 
     def _pipeline(self):
+        if getattr(self.param, "extra_run_times", None):
+            self._pipeline_parallel([self.run_time] + self.param.extra_run_times)
+        else:
+            self._pipeline_serial()
+
+    def _pull(self):
+        """
+        Next (tensor, frame) pair, letterboxed tensor in a buffer of its own
+        so several can be in flight. None at end of stream.
+        """
+        input_img = self.gst_pipe.pull_tensor(
+            self.gst_pre_inp,
+            self.sub_flow.input.loop,
+            self.pull_size[0],
+            self.pull_size[1],
+            self.sub_flow.model.data_layout,
+            self.sub_flow.model.input_tensor_types[0],
+        )
+        if input_img is None:
+            return None
+        if self.letterbox:
+            w, h = self.letterbox
+            buf = self.pad_buffer.copy()
+            if self.sub_flow.model.data_layout == "NCHW":
+                buf[:, :, :h, :w] = input_img
+            else:
+                buf[:, :h, :w, :] = input_img
+            input_img = buf
+        # The frame belongs to the same capture as the tensor; pull it right
+        # away so the pair can travel through the workers together.
+        frame = self.gst_pipe.pull_frame(self.gst_sen_inp, self.sub_flow.input.loop)
+        if frame is None:
+            return None
+        return input_img, frame
+
+    def _pipeline_parallel(self, run_times):
+        """
+        One capture loop (this thread), one inference worker per C7x runtime,
+        results handed on strictly in capture order: tracking, the servo loop
+        and the Kalman filters all assume consecutive frames.
+
+        Capture blocks while every worker is busy, like the serial loop does
+        during inference; the appsinks keep at most two buffers and drop the
+        older ones, so waiting never builds up latency.
+        """
+        jobs = queue.Queue(maxsize=len(run_times))
+        results = {}
+        results_cv = threading.Condition()
+        stopping = threading.Event()
+        errors = []
+
+        def worker(run_time):
+            try:
+                while not stopping.is_set():
+                    try:
+                        seq, tensor, frame = jobs.get(timeout=0.2)
+                    except queue.Empty:
+                        continue
+                    start = time()
+                    result = run_time(tensor)
+                    self.sub_flow.report.report_proctime("dl-inference", time() - start)
+                    with results_cv:
+                        results[seq] = (frame, result)
+                        results_cv.notify_all()
+            except BaseException as e:
+                errors.append(e)
+                stopping.set()
+
+        def output():
+            try:
+                nxt = 0
+                while not stopping.is_set():
+                    with results_cv:
+                        if nxt not in results:
+                            results_cv.wait(0.2)
+                            continue
+                        frame, result = results.pop(nxt)
+                    nxt += 1
+                    if self.infer_debug:
+                        self.infer_debug.log(str(result))
+                    out_frame = self.post_proc(frame, result)
+                    self.gst_pipe.push_frame(out_frame, self.gst_post_out)
+                    self.sub_flow.report.report_frame()
+            except BaseException as e:
+                errors.append(e)
+                stopping.set()
+
+        threads = [threading.Thread(target=worker, args=(rt,), daemon=True)
+                   for rt in run_times]
+        threads.append(threading.Thread(target=output, daemon=True))
+        for t in threads:
+            t.start()
+
+        seq = 0
+        try:
+            while not self.stop_thread and not stopping.is_set():
+                pair = self._pull()
+                if pair is None:
+                    break
+                tensor, frame = pair
+                if self.pre_proc_debug:
+                    self.pre_proc_debug.log(str(tensor.flatten()))
+                while not stopping.is_set():
+                    try:
+                        jobs.put((seq, tensor, frame), timeout=0.2)
+                        break
+                    except queue.Full:
+                        pass
+                seq += 1
+        finally:
+            stopping.set()
+            for t in threads:
+                t.join(2.0)
+            self.stop_thread = True
+            self.gst_pipe.send_eos(self.gst_post_out)
+        if errors:
+            raise errors[0]
+
+    def _pipeline_serial(self):
         while self.stop_thread == False:
             # capture and pre-process
             input_img = self.gst_pipe.pull_tensor(

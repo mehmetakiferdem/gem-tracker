@@ -107,6 +107,23 @@ class EdgeAIDemo:
                 # Initialize the runtime
                 model_obj.create_runtime()
 
+                # Second C7x. J722S has two (core-id [1, 2]); one inference
+                # takes ~53 ms with the face model, so a single core caps the
+                # loop at ~15 fps. infer_cores: 2 opens the same model on the
+                # other core as well and InferPipe runs alternate frames on
+                # each. Only when the model has the device map to itself.
+                model_obj.extra_run_times = []
+                cores = gst_element_map['inferer'].get('core-id', [])
+                if enable_tidl and model_config.get("infer_cores", 1) >= 2:
+                    for other in cores:
+                        if other == core_id:
+                            continue
+                        extra = ModelConfig(model_path, enable_tidl, other)
+                        extra.create_runtime()
+                        model_obj.extra_run_times.append(extra.run_time)
+                        print("[INFO] %s also on C7x core %d" % (model, other))
+                        break
+
                 # Letterbox. edgeai_dl_inferer ignores preprocess.resize_with_pad,
                 # so the app used to stretch 16:9 frames onto a square input.
                 # A model trained on padded input (the YOLOX ones, the WIDER
@@ -171,6 +188,11 @@ class EdgeAIDemo:
                     "redetect_interval",
                     "hit_counter_max",
                     "initialization_delay",
+                    "match_distance",
+                    "match_threshold",
+                    "kalman_q",
+                    "lock_reacquire_sizes",
+                    "lock_reacquire_scale",
                     "web_view_port",
                     "display_fb",
                     "display_rotate",
@@ -323,3 +345,4 @@ class EdgeAIDemo:
         # Hack del for model_obj is not called since refcount is not 1 here.
         for _,model_obj in self.models.items():
             del model_obj.run_time
+            model_obj.extra_run_times.clear()

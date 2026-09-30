@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Gemstone Tracker</title>
+<style>
+  :root {
+    --bg: #0d1014; --panel: #161b22; --panel-2: #1d242d; --line: #2a333e;
+    --text: #e6edf3; --muted: #8b98a5; --accent: #22c3ee; --ok: #3fb950;
+    --warn: #f0a020; --hot: #f04438; --radius: 12px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  body { padding: 12px 16px calc(16px + env(safe-area-inset-bottom)); }
+  header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+  header h1 { font-size: 16px; margin: 0 auto 0 0; letter-spacing: .5px; }
+  .pill { background: var(--panel); border: 1px solid var(--line); border-radius: 999px;
+    padding: 4px 10px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .pill b { color: var(--text); font-weight: 600; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--muted); margin-right: 6px; vertical-align: 1px; }
+  .dot.on { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .dot.warn { background: var(--warn); }
+  .dot.off { background: var(--hot); }
+
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; align-items: start; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+
+  .view { position: relative; background: #000; border-radius: var(--radius); overflow: hidden;
+    border: 1px solid var(--line); aspect-ratio: 16 / 9; cursor: crosshair; }
+  .view img { width: 100%; height: 100%; object-fit: contain; display: block; user-select: none; }
+  .view .hint { position: absolute; left: 10px; bottom: 8px; font-size: 12px; color: #fffa;
+    text-shadow: 0 1px 2px #000; pointer-events: none; }
+  .view .offline { position: absolute; inset: 0; display: none; place-items: center;
+    background: #000c; color: var(--muted); font-size: 15px; }
+  .view.stale .offline { display: grid; }
+  .tapmark { position: absolute; width: 44px; height: 44px; margin: -22px 0 0 -22px;
+    border: 3px solid var(--warn); border-radius: 50%; pointer-events: none;
+    animation: tap .6s ease-out forwards; }
+  @keyframes tap { from { transform: scale(.4); opacity: 1; } to { transform: scale(1.3); opacity: 0; } }
+
+  aside { display: grid; gap: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px; }
+  .card h2 { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase;
+    letter-spacing: .8px; margin: 0 0 10px; }
+
+  .score { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; text-align: center; }
+  .score div { background: var(--panel-2); border-radius: 10px; padding: 8px 4px; }
+  .score b { display: block; font-size: 22px; font-variant-numeric: tabular-nums; }
+  .score span { font-size: 11px; color: var(--muted); }
+
+  .fire-row { display: flex; align-items: center; gap: 14px; }
+  .fire { --p: 1; position: relative; width: 108px; height: 108px; flex: none; border-radius: 50%;
+    border: 0; padding: 0; cursor: pointer; color: #fff; font: 700 17px/1 inherit; letter-spacing: 1px;
+    background: conic-gradient(var(--accent) calc(var(--p) * 360deg), var(--line) 0); }
+  .fire::before { content: ""; position: absolute; inset: 6px; border-radius: 50%;
+    background: radial-gradient(circle at 50% 35%, #ff6b5e, var(--hot) 55%, #a1170f); z-index: 0;
+    box-shadow: inset 0 -6px 12px #0006; transition: transform .06s; }
+  .fire span { position: relative; z-index: 1; }
+  .fire:active::before, .fire.kick::before { transform: scale(.93); }
+  .fire:disabled { cursor: default; filter: grayscale(.4) brightness(.85); }
+  .fire-info { font-size: 12px; color: var(--muted); }
+  .fire-info b { color: var(--text); }
+  #result { font-weight: 700; font-size: 18px; min-height: 24px; }
+  #result.hit { color: var(--hot); } #result.miss { color: var(--warn); }
+
+  .seg { display: grid; grid-template-columns: repeat(4, 1fr); background: var(--panel-2);
+    border-radius: 10px; padding: 3px; gap: 3px; }
+  .seg button, .mode button { border: 0; background: transparent; color: var(--muted); padding: 9px 4px;
+    border-radius: 8px; font: 600 12px inherit; cursor: pointer; }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: #041017; }
+
+  .mode { display: grid; grid-template-columns: 1fr 1fr; gap: 3px; background: var(--panel-2);
+    border-radius: 10px; padding: 3px; margin-bottom: 12px; }
+  .mode button[aria-pressed="true"].auto { background: var(--ok); color: #04130a; }
+  .mode button[aria-pressed="true"].manual { background: var(--warn); color: #1a1000; }
+  .estop { width: 100%; border: 0; border-radius: 10px; padding: 12px; margin-bottom: 12px;
+    font: 700 14px inherit; letter-spacing: .5px; cursor: pointer; color: #fff; background: var(--hot); }
+  .estop.off { background: var(--panel-2); color: var(--warn); border: 1px solid var(--warn); }
+  .pad.disabled { opacity: .35; pointer-events: none; }
+
+  .pad { display: grid; grid-template-columns: repeat(3, 56px); grid-template-rows: repeat(3, 56px);
+    gap: 6px; justify-content: center; touch-action: none; }
+  .pad button { border: 1px solid var(--line); background: var(--panel-2); color: var(--text);
+    border-radius: 10px; font-size: 20px; cursor: pointer; user-select: none; -webkit-user-select: none; }
+  .pad button.held { background: var(--accent); color: #041017; border-color: var(--accent); }
+  .pad .u { grid-area: 1 / 2; } .pad .l { grid-area: 2 / 1; } .pad .r { grid-area: 2 / 3; }
+  .pad .d { grid-area: 3 / 2; } .pad .c { grid-area: 2 / 2; font-size: 11px; color: var(--muted); }
+
+  .kbd { font-size: 11px; color: var(--muted); margin-top: 10px; text-align: center; }
+  kbd { background: var(--panel-2); border: 1px solid var(--line); border-bottom-width: 2px;
+    border-radius: 4px; padding: 0 5px; font: 11px ui-monospace, monospace; color: var(--text); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Gemstone O1 · Tracker</h1>
+  <span class="pill"><span class="dot" id="conn"></span><b id="state">Bağlanıyor…</b></span>
+  <span class="pill">FPS <b id="fps">–</b></span>
+  <span class="pill">PAN <b id="pan">–</b>° TILT <b id="tilt">–</b>°</span>
+</header>
+
+<main>
+  <div class="view" id="view" title="Bir yüze tıkla: kilitlen. Boşluğa tıkla: kilidi bırak.">
+    <img id="stream" src="/stream" alt="Kamera görüntüsü">
+    <div class="hint">Yüze tıkla: kilitlen · boşluğa tıkla: kilidi bırak</div>
+    <div class="offline">Görüntü bekleniyor…</div>
+  </div>
+
+  <aside>
+    <section class="card">
+      <h2>Atış</h2>
+      <div class="fire-row">
+        <button class="fire" id="fire" aria-label="Ateş et (Boşluk)"><span>ATEŞ</span></button>
+        <div>
+          <div id="result" aria-live="polite"></div>
+          <div class="fire-info">Hedef: <b id="target">yok</b></div>
+          <div class="fire-info">En iyi seri: <b id="best">0</b></div>
+        </div>
+      </div>
+      <div class="score" style="margin-top:12px">
+        <div><b id="hits">0</b><span>İSABET</span></div>
+        <div><b id="acc">–</b><span>ORAN</span></div>
+        <div><b id="streak">0</b><span>SERİ</span></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Kontrol</h2>
+      <button class="estop" id="estop" aria-pressed="false">SERVOLARI DURDUR</button>
+      <div class="mode" role="group" aria-label="Mod">
+        <button class="auto" id="auto" aria-pressed="true">OTO</button>
+        <button class="manual" id="manual" aria-pressed="false">MANUEL</button>
+      </div>
+      <div class="pad" id="pad">
+        <button class="u" data-r="0" data-u="1" aria-label="Yukarı">▲</button>
+        <button class="l" data-r="-1" data-u="0" aria-label="Sol">◀</button>
+        <button class="c" id="servo" disabled>SERVO</button>
+        <button class="r" data-r="1" data-u="0" aria-label="Sağ">▶</button>
+        <button class="d" data-r="0" data-u="-1" aria-label="Aşağı">▼</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Görüntü</h2>
+      <div class="seg" id="effects" role="group" aria-label="Görüntü stili">
+        <button data-fx="plain" aria-pressed="false">SADE</button>
+        <button data-fx="aim" aria-pressed="false">NİŞAN</button>
+        <button data-fx="night" aria-pressed="false">GECE</button>
+        <button data-fx="thermal" aria-pressed="false">TERMAL</button>
+      </div>
+      <div class="kbd"><kbd>Boşluk</kbd> ateş · <kbd>←↑↓→</kbd> hareket · <kbd>M</kbd> mod · <kbd>1-4</kbd> stil · <kbd>Esc</kbd> servo dur · <kbd>S</kbd> servo aç/kapa</div>
+    </section>
+  </aside>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const COOLDOWN = 0.35;          // s, fire.COOLDOWN
+let state = {}, lastShots = 0, lastOk = 0;
+
+async function api(path, body) {
+  const res = await fetch(path, {
+    method: body === undefined ? "GET" : "POST",
+    headers: body === undefined ? {} : { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.status);
+  const s = await res.json();
+  render(s);
+  return s;
+}
+
+function render(s) {
+  state = s; lastOk = performance.now();
+  $("conn").className = "dot on";
+  $("state").textContent = (s.manual ? "MANUEL · " : "") + (s.state || "–") + (s.searching ? " · tarama" : "");
+  $("fps").textContent = s.fps ?? "–";
+  $("pan").textContent = s.pan ?? "–";
+  $("tilt").textContent = s.tilt ?? "–";
+  $("target").textContent = s.locked_id != null ? "ID " + s.locked_id : "yok";
+  $("hits").textContent = s.hits ?? 0;
+  $("acc").textContent = s.accuracy != null ? "%" + s.accuracy : "–";
+  $("streak").textContent = s.streak ?? 0;
+  $("best").textContent = s.best_streak ?? 0;
+  $("auto").setAttribute("aria-pressed", String(!s.manual));
+  $("manual").setAttribute("aria-pressed", String(!!s.manual));
+  $("servo").textContent = !s.servo ? "SERVO YOK" : (s.servo_on === false ? "DURDU" : "SERVO");
+  const on = s.servo_on !== false, es = $("estop");
+  es.textContent = on ? "SERVOLARI DURDUR" : "SERVOLARI AÇ";
+  es.classList.toggle("off", !on);
+  es.setAttribute("aria-pressed", String(!on));
+  $("pad").classList.toggle("disabled", !on);
+  for (const b of $("effects").children) b.setAttribute("aria-pressed", String(b.dataset.fx === s.effect));
+  const fire = $("fire"), cd = s.cooldown || 0;
+  fire.style.setProperty("--p", String(1 - cd / COOLDOWN));
+  if ((s.shots || 0) > lastShots) {
+    lastShots = s.shots;
+    const hit = s.streak > 0;
+    const r = $("result");
+    r.textContent = hit ? "VURULDU!" + (s.streak > 1 ? "  x" + s.streak : "") : "ISKA";
+    r.className = hit ? "hit" : "miss";
+    clearTimeout(render.t); render.t = setTimeout(() => { r.textContent = ""; }, 1200);
+  }
+}
+
+// Status poll: fast enough for the cooldown ring, cheap for the board.
+async function poll() {
+  try { await api("/api/state"); } catch (e) {}
+  const age = performance.now() - lastOk;
+  $("conn").className = "dot " + (age < 1500 ? "on" : "off");
+  if (age >= 1500) $("state").textContent = "Bağlantı yok";
+  setTimeout(poll, 250);
+}
+
+// Stream health: reconnect the MJPEG image if it stalls.
+let lastFrame = performance.now();
+$("stream").addEventListener("load", () => { lastFrame = performance.now(); $("view").classList.remove("stale"); });
+setInterval(() => {
+  const img = $("stream");
+  if (img.complete && img.naturalWidth) lastFrame = Math.max(lastFrame, performance.now() - 100);
+  if (performance.now() - lastOk > 3000) {
+    $("view").classList.add("stale");
+    img.src = "/stream?" + Date.now();
+  }
+}, 2000);
+
+function fire() {
+  const b = $("fire");
+  b.classList.add("kick"); setTimeout(() => b.classList.remove("kick"), 90);
+  api("/api/fire", {}).catch(() => {});
+}
+$("fire").addEventListener("click", fire);
+
+function servo(on) { if (!on) release(); api("/api/servo", { on }).catch(() => {}); }
+$("estop").addEventListener("click", () => servo(state.servo_on === false));
+$("auto").addEventListener("click", () => api("/api/mode", { manual: false }).catch(() => {}));
+$("manual").addEventListener("click", () => api("/api/mode", { manual: true }).catch(() => {}));
+for (const b of $("effects").children)
+  b.addEventListener("click", () => api("/api/effect", { effect: b.dataset.fx }).catch(() => {}));
+
+// Held direction: resend while held, the board drops it after 0.6 s of
+// silence, so a lost connection never leaves the camera turning.
+let held = null, heldTimer = null;
+function hold(r, u, btn) {
+  release();
+  held = { r, u, btn };
+  btn && btn.classList.add("held");
+  const send = () => api("/api/move", { right: r, up: u }).catch(() => {});
+  send(); heldTimer = setInterval(send, 200);
+}
+function release() {
+  if (!held) return;
+  clearInterval(heldTimer);
+  held.btn && held.btn.classList.remove("held");
+  held = null;
+  api("/api/move", { right: 0, up: 0 }).catch(() => {});
+}
+for (const b of $("pad").querySelectorAll("[data-r]")) {
+  b.addEventListener("pointerdown", (e) => { e.preventDefault(); b.setPointerCapture(e.pointerId);
+    hold(+b.dataset.r, +b.dataset.u, b); });
+  for (const ev of ["pointerup", "pointercancel", "lostpointercapture"]) b.addEventListener(ev, release);
+}
+window.addEventListener("blur", release);
+
+// Tap on the picture: fraction of the drawn image, letterbox excluded.
+$("view").addEventListener("click", (e) => {
+  const img = $("stream"), r = img.getBoundingClientRect();
+  const iw = img.naturalWidth || 16, ih = img.naturalHeight || 9;
+  const scale = Math.min(r.width / iw, r.height / ih);
+  const w = iw * scale, h = ih * scale, ox = (r.width - w) / 2, oy = (r.height - h) / 2;
+  const x = (e.clientX - r.left - ox) / w, y = (e.clientY - r.top - oy) / h;
+  if (x < 0 || x > 1 || y < 0 || y > 1) return;
+  const m = document.createElement("div");
+  m.className = "tapmark"; m.style.left = (e.clientX - r.left) + "px"; m.style.top = (e.clientY - r.top) + "px";
+  $("view").appendChild(m); setTimeout(() => m.remove(), 700);
+  api("/api/tap", { x, y }).catch(() => {});
+});
+
+const KEYS = { ArrowUp: [0, 1], ArrowDown: [0, -1], ArrowLeft: [-1, 0], ArrowRight: [1, 0] };
+const FX = { "1": "plain", "2": "aim", "3": "night", "4": "thermal" };
+window.addEventListener("keydown", (e) => {
+  if (e.target.closest && e.target.closest("input, textarea")) return;
+  if (e.code === "Space") { e.preventDefault(); if (!e.repeat) fire(); }
+  else if (KEYS[e.key]) { e.preventDefault(); if (!e.repeat) hold(...KEYS[e.key], null); }
+  else if (e.key === "Escape") servo(false);
+  else if (e.key === "s" || e.key === "S") servo(state.servo_on === false);
+  else if (e.key === "m" || e.key === "M") api("/api/mode", { manual: !state.manual }).catch(() => {});
+  else if (FX[e.key]) api("/api/effect", { effect: FX[e.key] }).catch(() => {});
+});
+window.addEventListener("keyup", (e) => { if (KEYS[e.key] && held && !held.btn) release(); });
+
+poll();
+</script>
+</body>
+</html>

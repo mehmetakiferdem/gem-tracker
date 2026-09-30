@@ -526,6 +526,15 @@ class PanTiltServoController:
         the stable range at 30 fps.
       - max_step caps a single update so a jumping box cannot yank the rig.
 
+    gain and max_step are per frame AT ref_fps; every update is scaled by the
+    time since the previous one, so the loop does the same in degrees per
+    second whatever the frame rate. Tuned per frame at 14 fps and run at 20
+    (two C7x cores), the fixed per frame gain moved 40 % faster and the rig
+    wobbled. The deadzone has hysteresis (tracking_math.DeadzoneHysteresis):
+    an axis that has come inside `deadzone` stays still until the error
+    leaves `deadzone_exit`, so a centred target's box jitter no longer makes
+    the servo twitch one step back and forth.
+
     The commanded angle accumulates continuously. A pulse is only rewritten
     when its width actually changes, so a target at rest does not keep
     restarting the PWM.
@@ -570,6 +579,10 @@ class PanTiltServoController:
         search_dwell=0.8,    # Seconds to stand still after each hop
         search_pan=(-60.0, 60.0),  # Sweep limits, degrees
         search_tilt=0.0,     # Tilt angle held while sweeping
+        ref_fps=14.0,        # Frame rate gain and max_step are meant for
+        deadzone_exit=0.05,  # Error that wakes a settled axis again
+        lead=0.0,            # Velocity feed forward horizon, s (0 = off)
+        lead_max_speed=40.0,  # Target speed above this is not trusted, deg/s
     ):
         self.backend = backend
         self.pwm_device = pwm_device
@@ -597,6 +610,14 @@ class PanTiltServoController:
         self.search_dwell = search_dwell
         self.search_pan = (min(search_pan), max(search_pan))
         self.search_tilt = search_tilt
+        self.ref_fps = max(1.0, float(ref_fps))
+        from tracking_math import DeadzoneHysteresis
+
+        self.dz_pan = DeadzoneHysteresis(deadzone, deadzone_exit)
+        self.dz_tilt = DeadzoneHysteresis(deadzone, deadzone_exit)
+        self._last_update = None
+        self.lead = max(0.0, float(lead))
+        self.lead_max_speed = float(lead_max_speed)
 
         # Sweep state. search_dir is +1/-1 in pan angle, and is pointed by
         # update() towards the side the target was last seen on, so a target
@@ -633,6 +654,13 @@ class PanTiltServoController:
 
     def _init_servos(self):
         import time
+
+        if self.backend == "none":
+            # Tracking and coordinates without moving the rig, e.g. while
+            # tuning the detector or with the servos unplugged.
+            self.enabled = False
+            print("[INFO] Pan-Tilt Servos disabled (servo_backend: none).")
+            return
 
         try:
             if self.backend == "hwpwm":
@@ -721,21 +749,42 @@ class PanTiltServoController:
                 pass
         return moved
 
-    def _step(self, error, half_fov):
-        """Degrees to move for a normalized error, 0 inside the deadzone."""
-        if abs(error) <= self.deadzone:
+    def _step(self, error, half_fov, dz, scale=1.0):
+        """
+        Degrees to move for a normalized error, 0 while the axis is settled.
+        scale is the time since the last update in frames at ref_fps.
+        """
+        if not dz.active(error):
             return 0.0
-        step = self.gain * error * half_fov
-        return max(-self.max_step, min(self.max_step, step))
+        step = self.gain * error * half_fov * scale
+        limit = self.max_step * scale
+        return max(-limit, min(limit, step))
 
-    def update(self, raw_dx, raw_dy):
-        """One control step towards the target at (raw_dx, raw_dy)."""
+    def update(self, raw_dx, raw_dy, vel=None):
+        """
+        One control step towards the target at (raw_dx, raw_dy).
+
+        vel is the target's own angular velocity (pan, tilt) in deg/s, with
+        camera motion already removed (Norfair's absolute velocity), in the
+        same sign convention as dx/dy. With lead > 0 the error is moved
+        forward by lead seconds along it: the picture is ~0.13 s old, so a
+        target moving at a steady speed is always that far ahead of what the
+        loop sees. Speeds above lead_max_speed are ignored (a jump, a
+        re-acquired box) rather than followed.
+        """
         import time
 
         if not self.enabled:
             return
 
         now = time.time()
+        # Frames at ref_fps since the last control step. The first step after
+        # a pause (search, manual, a lost target) counts as one frame.
+        if self._last_update is None or now - self._last_update > 0.5:
+            scale = 1.0
+        else:
+            scale = min(3.0, max(0.2, (now - self._last_update) * self.ref_fps))
+        self._last_update = now
         self.last_target_time = now
         self.searching = False
         self.next_hop_time = None
@@ -747,16 +796,21 @@ class PanTiltServoController:
 
         # Düşük geçiren filtre (kutu titreşimini süzer). Kept light: every bit
         # of smoothing is extra delay inside the loop.
-        self.smooth_dx = (
-            self.smoothing * self.smooth_dx + (1.0 - self.smoothing) * raw_dx
-        )
-        self.smooth_dy = (
-            self.smoothing * self.smooth_dy + (1.0 - self.smoothing) * raw_dy
-        )
+        if self.lead > 0.0 and vel is not None:
+            vx, vy = vel
+            if abs(vx) <= self.lead_max_speed:
+                raw_dx = raw_dx + vx * self.lead / self.half_hfov
+            if abs(vy) <= self.lead_max_speed:
+                raw_dy = raw_dy + vy * self.lead / self.half_vfov
+
+        # smoothing is per frame at ref_fps too.
+        k = self.smoothing ** scale
+        self.smooth_dx = k * self.smooth_dx + (1.0 - k) * raw_dx
+        self.smooth_dy = k * self.smooth_dy + (1.0 - k) * raw_dy
 
         # 1. PAN (Yatay Takip). Target right of centre (dx > 0) lowers the
         # angle unless inverted.
-        delta_pan = self._step(self.smooth_dx, self.half_hfov)
+        delta_pan = self._step(self.smooth_dx, self.half_hfov, self.dz_pan, scale)
         if self.pan_invert:
             delta_pan = -delta_pan
         self.pan_angle = max(
@@ -765,7 +819,7 @@ class PanTiltServoController:
 
         # 2. TILT (Dikey Takip). Target below centre (dy > 0) lowers the
         # angle unless inverted.
-        delta_tilt = self._step(self.smooth_dy, self.half_vfov)
+        delta_tilt = self._step(self.smooth_dy, self.half_vfov, self.dz_tilt, scale)
         if self.tilt_invert:
             delta_tilt = -delta_tilt
         self.tilt_angle = max(
@@ -859,6 +913,12 @@ class PanTiltServoController:
         """No target: keep the current angle, go silent once at rest."""
         import time
 
+        # Time spent holding is not owed to the loop: the next update
+        # scales from here, not from before the hold, so a target coming
+        # back after a missed detection does not get several frames of
+        # correction in one step.
+        if self._last_update is not None:
+            self._last_update = time.time()
         if self.enabled and 0 < self.release_after < time.time() - self.last_move_time:
             self.idle()
 
@@ -873,10 +933,33 @@ class PanTiltServoController:
         except Exception:
             pass
 
+    def disarm(self):
+        """Servo stop: drop any recoil and cut the pulses; the rig goes limp."""
+        self.recoil_steps = []
+        self.searching = False
+        self.idle()
+
+    def arm(self):
+        """
+        Back from a servo stop. idle() keeps the last pulse widths, so _send
+        would skip an unchanged angle and leave the rig limp; forget them.
+        """
+        import time
+
+        if not self.enabled:
+            return
+        self.pan_pw = self.tilt_pw = None
+        self._send(self.pan_angle, self.tilt_angle)
+        self.last_move_time = self.last_target_time = time.time()
+        self.reset_filters()
+
     def reset_filters(self):
         """Reset smoothing filters when acquiring a new target."""
         self.smooth_dx = 0.0
         self.smooth_dy = 0.0
+        self.dz_pan.reset()
+        self.dz_tilt.reset()
+        self._last_update = None
 
     def close(self):
         if not self.enabled:
@@ -984,8 +1067,21 @@ class PostProcessTracking(PostProcess):
     # person lost and regained identity several times a minute; every one of
     # those renames breaks anything downstream that locked onto an id. One
     # second of grace costs nothing and removes most of the churn.
-    DISTANCE_THRESHOLD_BBOX = 1.0
-    DISTANCE_FUNCTION = "iou"
+    #
+    # Association. Plain IoU put every pair of boxes that no longer overlap
+    # at the same distance, 1.0, so a face that moved more than its own width
+    # between two frames could not be matched at all. At 14 fps that is a
+    # normal head turn: in tools/sim_tracking.py a face sweeping at 30 px per
+    # frame went through 6 ids in 240 frames, at 60 px 15. DIoU (see
+    # tracking_math.diou_distance) keeps ranking such pairs by centre
+    # distance; with a threshold of 1.5 and a Kalman filter that picks up
+    # velocity faster (KALMAN_Q) the same face kept 1.0 ids at 30-60 px and
+    # 1.2 with 15 % of the detections missing, and two faces walking past
+    # each other never swapped ids. Q=5 raises the estimate jitter of a
+    # still face from 1.1 to 1.5 px, far inside the servo deadzone.
+    DISTANCE_THRESHOLD_BBOX = 1.5
+    DISTANCE_FUNCTION = "diou"
+    KALMAN_Q = 5.0
     INITIALIZATION_DELAY = 4
     HIT_COUNTER_MAX = 30
 
@@ -1032,6 +1128,35 @@ class PostProcessTracking(PostProcess):
     # when re-acquiring. Large enough to survive a rename, small enough not to
     # jump to a different object across the room.
     LOCK_REACQUIRE_RADIUS = 0.25
+
+    # Re-acquisition in target sizes rather than frame pixels, see
+    # tracking_math.reacquire_score: the new box's centre within
+    # LOCK_REACQUIRE_SIZES of the lost box's size, and its size within
+    # LOCK_REACQUIRE_SCALE either way. LOCK_REACQUIRE_RADIUS stays as an
+    # outer bound.
+    LOCK_REACQUIRE_SIZES = 4.0
+    LOCK_REACQUIRE_SCALE = 2.0
+
+    # Frames a track must have lived before its Kalman velocity is used for
+    # the servo lead: a new track starts at zero velocity and needs a few
+    # updates to learn it.
+    VELOCITY_MIN_AGE = 8
+
+    # Jump gate: a locked box whose centre moves more than JUMP_LIMIT (in
+    # normalized error, 0.35 = 224 px at 1280) since the last live frame is
+    # not steered after until it has stayed there JUMP_CONFIRM frames. On
+    # the rig a lock's box went from dx +0.53 to -0.44 in two frames (a
+    # different face or a false detection taking the track over) and the
+    # servos swung after it.
+    JUMP_LIMIT = 0.35
+    JUMP_CONFIRM = 3
+
+    # Runaway watchdog: pan at its end stop with the error still pointing
+    # past it for RUNAWAY_TIME seconds means the lock cannot be reached (a
+    # face on a screen showing this very camera, a target outside the
+    # mechanical range). The lock is dropped so the rig does not sit pinned
+    # against the stop.
+    RUNAWAY_TIME = 1.5
 
     # How many frames after a lock is lost the last target position still
     # decides who gets the next lock. A fast pan blurs the target for a few
@@ -1105,17 +1230,38 @@ class PostProcessTracking(PostProcess):
         # trail all share one stable colour for as long as the id lives.
         self.Palette = Palette
 
+        from norfair.distances import VectorizedDistance
+        from norfair.filter import OptimizedKalmanFilterFactory
+        from tracking_math import diou_distance
+
+        match = str(getattr(self.model, "match_distance", self.DISTANCE_FUNCTION)).lower()
+        if match not in ("iou", "diou"):
+            print("[WARNING] Unknown match_distance '%s', using diou." % match)
+            match = "diou"
         self.tracker = Tracker(
             initialization_delay=int(
                 getattr(self.model, "initialization_delay",
                         self.INITIALIZATION_DELAY)
             ),
-            distance_function=self.DISTANCE_FUNCTION,
-            distance_threshold=self.DISTANCE_THRESHOLD_BBOX,
+            distance_function="iou",
+            distance_threshold=float(
+                getattr(self.model, "match_threshold",
+                        self.DISTANCE_THRESHOLD_BBOX if match == "diou" else 1.0)
+            ),
             hit_counter_max=int(
                 getattr(self.model, "hit_counter_max", self.HIT_COUNTER_MAX)
             ),
+            filter_factory=OptimizedKalmanFilterFactory(
+                Q=float(getattr(self.model, "kalman_q", self.KALMAN_Q))
+            ),
         )
+        if match == "diou":
+            # Norfair 2.3 only takes a name or a scalar (per pair, slow)
+            # function in the constructor; swap the vectorized one in.
+            self.tracker.distance_function = VectorizedDistance(diou_distance)
+        print("[INFO] Association: %s, threshold %.2f, Kalman Q %.1f" % (
+            match, self.tracker.distance_threshold,
+            float(getattr(self.model, "kalman_q", self.KALMAN_Q))))
 
         self.pathd = PathDraw(history_size=self.PATH_HISTORY_SIZE)
 
@@ -1145,6 +1291,19 @@ class PostProcessTracking(PostProcess):
         # Last known target box in frame pixels, [x1, y1, x2, y2]. Kept even
         # while the lock is lost so re-acquisition has something to aim at.
         self.locked_box = None
+        # The same box in world coordinates (camera motion removed), when the
+        # servos report where the camera points; re-acquisition compares in
+        # these so a lock lost during a pan is looked for where the target
+        # really is, not where it used to be on the screen.
+        self.locked_abs = None
+        self._abs_ok = False
+        self._gate_ref = None      # (id, dx, dy) of the last accepted live frame
+        self._gate_count = 0
+        self._runaway_since = None
+        self.lock_reacquire_sizes = float(
+            getattr(m, "lock_reacquire_sizes", self.LOCK_REACQUIRE_SIZES))
+        self.lock_reacquire_scale = float(
+            getattr(m, "lock_reacquire_scale", self.LOCK_REACQUIRE_SCALE))
         # Frame the lock was last lost on, for LOCK_MEMORY_FRAMES.
         self.lock_lost_frame = None
         # Human readable state, drawn in the badge and used by report().
@@ -1207,7 +1366,6 @@ class PostProcessTracking(PostProcess):
         # anywhere else to drop the lock and let lock_policy pick again. The
         # tap arrives on the touch thread and is only recorded here; the next
         # frame acts on it in update_lock(). "" turns it off.
-        self.touch_request = None
         self.touch_marker = None
         self.touch = None
         self.ui = None
@@ -1222,11 +1380,16 @@ class PostProcessTracking(PostProcess):
             self.hud_style = "aim"
         self._manual_time = None
         self._all_tracked = []
-        # Fire button state: frame of the last shot, its result, the score.
-        self.fire_frame = None
-        self.fire_hit = False
-        self.fire_point = None
-        self.score = 0
+        # Operator state shared by the panel and the browser (controls.py),
+        # and the fire button game (fire.py).
+        from controls import Controls
+        from fire import FireControl
+
+        self.controls = Controls(effect=self.hud_style)
+        self.fire = FireControl()
+        self._servo_stopped = False
+        self._fps = 0.0
+        self._fps_time = None
         touch_dev = str(getattr(self.model, "display_touch", "auto"))
         if self.fb_view and touch_dev:
             try:
@@ -1237,15 +1400,14 @@ class PostProcessTracking(PostProcess):
                 def on_picture_tap(px, py):
                     pt = self.fb_view.panel_to_frame(px, py)
                     if pt is not None:
-                        self.touch_request = pt
-                        self.touch_marker = (pt, self.frame_count)
+                        self.controls.request_tap(pt)
 
                 self.ui = PanelUI(
-                    self.fb_view.width, self.fb_view.height, on_picture_tap,
-                    effect=self.hud_style,
+                    self.fb_view.width, self.fb_view.height, self.controls,
+                    on_picture_tap,
                 )
                 self.fb_view.ui = self.ui
-                self.fb_view.filter = lambda f: self.hud.filter(f, self.ui.effect)
+                self.fb_view.filter = lambda f: self.hud.filter(f, self.controls.effect)
                 self.touch = TouchInput(
                     self.ui.down, self.ui.up, device=touch_dev
                 )
@@ -1259,7 +1421,7 @@ class PostProcessTracking(PostProcess):
             try:
                 from web_view import WebView
 
-                self.web_view = WebView(port=web_port)
+                self.web_view = WebView(port=web_port, controls=self.controls)
             except Exception as exc:
                 print("[WARNING] Web view disabled: %s" % exc)
 
@@ -1312,6 +1474,10 @@ class PostProcessTracking(PostProcess):
             deadzone=float(getattr(m, "servo_deadzone", 0.03)),
             gain=float(getattr(m, "servo_gain", 0.10)),
             max_step=float(getattr(m, "servo_max_step", 1.5)),
+            ref_fps=float(getattr(m, "servo_ref_fps", 14.0)),
+            lead=float(getattr(m, "servo_lead", 0.0)),
+            deadzone_exit=float(getattr(m, "servo_deadzone_exit",
+                                        2.0 * float(getattr(m, "servo_deadzone", 0.03)) - 0.01)),
             smoothing=float(getattr(m, "servo_smoothing", 0.3)),
             hfov=float(getattr(m, "servo_hfov", 40.0)),
             vfov=float(getattr(m, "servo_vfov", 23.0)),
@@ -1479,9 +1645,10 @@ class PostProcessTracking(PostProcess):
         else:
             detections = self.yolo_detections_to_norfair_detections(bbox)
             self._live_detections = set(id(d) for d in detections)
+            transform = self.camera_motion(img.shape[1], img.shape[0])
+            self._abs_ok = transform is not None
             tracked_objects = self.tracker.update(
-                detections=detections,
-                coord_transformations=self.camera_motion(img.shape[1], img.shape[0]),
+                detections=detections, coord_transformations=transform,
             )
             if self.track_mode == self.MODE_LOCK:
                 self._all_tracked = tracked_objects
@@ -1502,27 +1669,22 @@ class PostProcessTracking(PostProcess):
                 (self.servo_controller.pan_angle, self.servo_controller.tilt_angle)
             )
 
-        style = self.ui.effect if self.ui is not None else self.hud_style
+        style = self.controls.effect
 
-        # Fire: a hit when the locked target's centre is near the crosshair.
-        if self.ui is not None and self.ui.fire_request:
-            self.ui.fire_request = False
-            if self.fire_frame is None or self.frame_count - self.fire_frame >= 8:
-                self.fire_frame = self.frame_count
-                self.fire_hit, self.fire_point = False, None
-                if self.state.startswith("LOCKED") and tracked_objects:
-                    x1, y1, x2, y2 = self.box_of(tracked_objects[0])
-                    tx, ty = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-                    self.fire_point = (int(tx), int(ty))
-                    half = max(abs(x2 - x1), abs(y2 - y1)) / 2.0
-                    dist = ((tx - img.shape[1] / 2.0) ** 2 + (ty - img.shape[0] / 2.0) ** 2) ** 0.5
-                    self.fire_hit = dist <= max(60.0, half)
-                if self.fire_hit:
-                    self.score += 1
-                if self.servo_controller and self.servo_controller.enabled:
+        # Fire, from the panel or the browser. fire.py decides hit or miss
+        # and enforces the cooldown; a request during it is dropped.
+        if self.controls.take_fire():
+            target = None
+            if self.state.startswith("LOCKED") and tracked_objects:
+                target = (self.box_of(tracked_objects[0]), tracked_objects[0].id)
+            shot = self.fire.fire(img.shape[1], img.shape[0], target)
+            if shot is not None:
+                if (self.servo_controller and self.servo_controller.enabled
+                        and self.controls.servo_on):
                     self.servo_controller.recoil()
-                print("[f:%d] ! fire: %s (score %d)" % (
-                    self.frame_count, "hit" if self.fire_hit else "miss", self.score), flush=True)
+                print("[f:%d] ! fire: %s (%d/%d)" % (
+                    self.frame_count, "hit" if shot.hit else "miss",
+                    self.fire.hits, self.fire.shots), flush=True)
         locked_ids = set(o.id for o in tracked_objects)
         others = [
             self.box_of(o) for o in self._all_tracked if o.id not in locked_ids
@@ -1553,21 +1715,38 @@ class PostProcessTracking(PostProcess):
                 self.hud.draw(
                     img, style, self.frame_count, locked, others, self.state,
                     sc.pan_angle if sc else 0.0, sc.tilt_angle if sc else 0.0,
-                    self.ui is not None and self.ui.manual,
+                    self.controls.manual,
                     bool(sc and sc.searching),
                 )
             except Exception as exc:
                 # Decoration only: never let a drawing bug stop tracking.
                 print("[WARNING] HUD draw failed: %s" % exc, flush=True)
 
-        if self.fire_frame is not None:
-            try:
-                self.hud.draw_fire(
-                    img, self.frame_count - self.fire_frame, self.fire_hit,
-                    self.fire_point, self.score,
-                )
-            except Exception as exc:
-                print("[WARNING] fire effect failed: %s" % exc, flush=True)
+        now = self.fire.clock()
+        shot = self.fire.active(now)
+        stats = self.fire.stats()
+        try:
+            if shot is not None:
+                # The impact follows the target that was hit, while it is
+                # still tracked.
+                point, half = shot.point, None
+                for o in self._all_tracked:
+                    if o.id == shot.target_id:
+                        x1, y1, x2, y2 = self.box_of(o)
+                        point = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+                        half = int(abs(y2 - y1) / 2)
+                        break
+                self.hud.draw_fire(img, shot, now, point, stats, target_half=half)
+            self.hud.draw_score(img, stats, self.fire.cooldown_left(now))
+        except Exception as exc:
+            # Decoration only: never let a drawing bug stop tracking.
+            print("[WARNING] fire effect failed: %s" % exc, flush=True)
+
+        if self._servo_stopped:
+            from hud import _text_centered, RED
+            k = img.shape[1] / 1280.0
+            _text_centered(img, "SERVO DURDURULDU", (img.shape[1] // 2, int(110 * k)),
+                           RED, 0.9 * k, max(2, int(2 * k)))
 
         # Where the last tap landed, for about half a second, so a tap that
         # misses the box is visible on the panel as a miss.
@@ -1578,6 +1757,7 @@ class PostProcessTracking(PostProcess):
             else:
                 self.touch_marker = None
 
+        self.publish_status(img, tracked_objects, now, stats)
         if self.web_view:
             self.web_view.publish(img)
         if self.fb_view:
@@ -1598,6 +1778,22 @@ class PostProcessTracking(PostProcess):
         """Flatten a Norfair estimate into [x1, y1, x2, y2] floats."""
         p = obj.estimate
         return [float(p[0][0]), float(p[0][1]), float(p[1][0]), float(p[1][1])]
+
+    def abs_box_of(self, obj):
+        """World coordinate box, or None without camera motion data."""
+        if not self._abs_ok:
+            return None
+        try:
+            p = obj.get_estimate(absolute=True)
+        except ValueError:
+            return None
+        return [float(p[0][0]), float(p[0][1]), float(p[1][0]), float(p[1][1])]
+
+    def set_lock(self, obj, box=None):
+        self.locked_id = obj.id
+        self.locked_box = box if box is not None else self.box_of(obj)
+        self.locked_abs = self.abs_box_of(obj)
+        self.state = "LOCKED id=%d" % obj.id
 
     @staticmethod
     def box_center(box):
@@ -1667,9 +1863,10 @@ class PostProcessTracking(PostProcess):
         # A tap on the panel since the last frame. On an object: lock onto
         # it, whatever lock_policy would have picked. Off every object: drop
         # the lock and its memory, so the automatic pick below starts over.
-        req, self.touch_request = self.touch_request, None
+        req = self.controls.take_tap()
         if req is not None:
             tx, ty = req
+            self.touch_marker = (req, self.frame_count)
             hits = [
                 (obj, box)
                 for obj, box in ((o, self.box_of(o)) for o in tracked_objects)
@@ -1681,12 +1878,9 @@ class PostProcessTracking(PostProcess):
                     hits, key=lambda ob: (ob[1][2] - ob[1][0]) * (ob[1][3] - ob[1][1])
                 )
                 print("[f:%d] * touch lock id=%d" % (self.frame_count, obj.id))
-                if self.ui is not None:
-                    self.ui.manual = False
-                self.locked_id = obj.id
-                self.locked_box = box
+                self.controls.set_manual(False)
+                self.set_lock(obj, box)
                 self.lock_lost_frame = None
-                self.state = "LOCKED id=%d" % obj.id
                 return [obj]
             print(
                 "[f:%d] - touch release (id=%s) at (%d,%d), boxes %s"
@@ -1696,13 +1890,13 @@ class PostProcessTracking(PostProcess):
             )
             self.locked_id = None
             self.locked_box = None
+            self.locked_abs = None
             self.lock_lost_frame = None
 
         # Still holding the same id: nothing to decide.
         if self.locked_id is not None and self.locked_id in by_id:
             obj = by_id[self.locked_id]
-            self.locked_box = self.box_of(obj)
-            self.state = "LOCKED id=%d" % obj.id
+            self.set_lock(obj)
             return [obj]
 
         candidates = [(obj, self.box_of(obj)) for obj in tracked_objects]
@@ -1718,27 +1912,33 @@ class PostProcessTracking(PostProcess):
             and self.locked_box is not None
             and candidates
         ):
-            lcx, lcy = self.box_center(self.locked_box)
-            diag = (frame_w ** 2 + frame_h ** 2) ** 0.5
-            limit = self.LOCK_REACQUIRE_RADIUS * diag
+            from tracking_math import best_reacquire
 
-            nearest, best = None, None
-            for obj, box in candidates:
-                cx, cy = self.box_center(box)
-                d = ((cx - lcx) ** 2 + (cy - lcy) ** 2) ** 0.5
-                if best is None or d < best:
-                    nearest, best = (obj, box), d
-
-            if nearest is not None and best <= limit:
-                obj, box = nearest
-                print(
-                    "[f:%d] ~ lock handed over id=%s -> id=%d (%.0f px)"
-                    % (self.frame_count, self.locked_id, obj.id, best)
-                )
-                self.locked_id = obj.id
-                self.locked_box = box
-                self.state = "LOCKED id=%d" % obj.id
-                return [obj]
+            # World coordinates when both sides have them, so camera motion
+            # since the loss does not count as target motion.
+            use_abs = self.locked_abs is not None and self._abs_ok
+            last = self.locked_abs if use_abs else self.locked_box
+            pool = [
+                ((obj, box), self.abs_box_of(obj) if use_abs else box)
+                for obj, box in candidates
+            ]
+            pool = [(k, b) for k, b in pool if b is not None]
+            best = best_reacquire(
+                last, pool, self.lock_reacquire_sizes, self.lock_reacquire_scale
+            )
+            if best is not None:
+                (obj, box), cand, score = best
+                (lx, ly), (cx, cy) = self.box_center(last), self.box_center(cand)
+                dist = ((cx - lx) ** 2 + (cy - ly) ** 2) ** 0.5
+                diag = (frame_w ** 2 + frame_h ** 2) ** 0.5
+                if dist <= self.LOCK_REACQUIRE_RADIUS * diag:
+                    print(
+                        "[f:%d] ~ lock handed over id=%s -> id=%d (%.0f px, score %.2f%s)"
+                        % (self.frame_count, self.locked_id, obj.id, dist, score,
+                           ", world" if use_abs else "")
+                    )
+                    self.set_lock(obj, box)
+                    return [obj]
 
         if not candidates:
             if self.locked_id is not None:
@@ -1752,9 +1952,7 @@ class PostProcessTracking(PostProcess):
         obj, box = self.pick_target(candidates, frame_w, frame_h)
         if obj.id != self.locked_id:
             print("[f:%d] * locked id=%d" % (self.frame_count, obj.id))
-        self.locked_id = obj.id
-        self.locked_box = box
-        self.state = "LOCKED id=%d" % obj.id
+        self.set_lock(obj, box)
         return [obj]
 
     # ----------------------------------------------------------------------
@@ -2035,17 +2233,30 @@ class PostProcessTracking(PostProcess):
         if not self.servo_controller or not self.servo_controller.enabled:
             return
 
+        # Servo stop from the panel or the browser: no pulses at all until
+        # it is released, whatever the mode.
+        if not self.controls.servo_on:
+            if not self._servo_stopped:
+                self.servo_controller.disarm()
+                self._servo_stopped = True
+                print("[f:%d] ! servo stop" % self.frame_count, flush=True)
+            return
+        if self._servo_stopped:
+            self.servo_controller.arm()
+            self._servo_stopped = False
+            print("[f:%d] ! servo on" % self.frame_count, flush=True)
+
         # Recoil after a shot runs on top of whatever mode is active.
         self.servo_controller.step_recoil()
 
-        if self.ui is not None and self.ui.manual:
+        if self.controls.manual:
             # MANUAL: the D-pad drives the servos, nothing else does.
             import time
 
             now = time.time()
             dt = 0.0 if self._manual_time is None else min(0.2, now - self._manual_time)
             self._manual_time = now
-            right, up = self.ui.move
+            right, up = self.controls.move
             if right or up:
                 step = self.manual_speed * dt
                 self.servo_controller.nudge(right * step, up * step)
@@ -2069,6 +2280,11 @@ class PostProcessTracking(PostProcess):
             # The filters are kept, this is a brief occlusion, not a new
             # target.
             self.servo_controller.hold()
+        elif is_locked and self.tracked_positions and not self.gate_jump(
+            self.tracked_positions[0]
+        ):
+            # A sudden jump of the locked box: hold, see gate_jump().
+            self.servo_controller.hold()
         elif is_locked and self.tracked_positions:
             target = self.tracked_positions[0]
             x1, y1, x2, y2 = target["bbox"]
@@ -2084,7 +2300,10 @@ class PostProcessTracking(PostProcess):
             else:
                 aim_y = y1 + self.servo_aim_y * (y2 - y1)
                 dy = (aim_y - frame_h / 2.0) / (frame_h / 2.0)
-            self.servo_controller.update(target["dx"], dy)
+            self.servo_controller.update(
+                target["dx"], dy, vel=self.target_velocity(frame_w, frame_h)
+            )
+            self.check_runaway(target["dx"])
         else:
             # No target: hold briefly where it was lost, then sweep for it.
             self.servo_controller.search()
@@ -2092,6 +2311,112 @@ class PostProcessTracking(PostProcess):
 
         if self.servo_debug and is_locked:
             self.debug_servo_line(dy)
+
+    def gate_jump(self, target):
+        """
+        True when this live measurement of the locked target may steer the
+        servos. A jump larger than JUMP_LIMIT from the last accepted one is
+        held back until it repeats for JUMP_CONFIRM frames; a new lock id
+        starts over.
+        """
+        dx = target["dx"]
+        dy = target["dy"]
+        ref = self._gate_ref
+        if ref is None or ref[0] != target["id"]:
+            self._gate_ref, self._gate_count = (target["id"], dx, dy), 0
+            return True
+        if max(abs(dx - ref[1]), abs(dy - ref[2])) <= self.JUMP_LIMIT:
+            self._gate_ref, self._gate_count = (target["id"], dx, dy), 0
+            return True
+        self._gate_count += 1
+        if self._gate_count >= self.JUMP_CONFIRM:
+            print("[f:%d] ~ jump accepted id=%d dx %+.2f -> %+.2f"
+                  % (self.frame_count, target["id"], ref[1], dx), flush=True)
+            self._gate_ref, self._gate_count = (target["id"], dx, dy), 0
+            return True
+        if self._gate_count == 1:
+            print("[f:%d] ~ jump held id=%d dx %+.2f -> %+.2f"
+                  % (self.frame_count, target["id"], ref[1], dx), flush=True)
+        return False
+
+    def check_runaway(self, dx):
+        """Drop the lock when pan sits at an end stop still chasing it."""
+        import time
+
+        sc = self.servo_controller
+        lo, hi = sc.pan_range
+        # The error keeps pushing pan further into the stop it is at: dx > 0
+        # lowers the pan angle (invert flips it).
+        push_down = (dx > 0) != bool(sc.pan_invert)
+        pinned = (sc.pan_angle <= lo + 0.5 and push_down) or (
+            sc.pan_angle >= hi - 0.5 and not push_down)
+        if not (pinned and abs(dx) > 0.3):
+            self._runaway_since = None
+            return
+        now = time.time()
+        if self._runaway_since is None:
+            self._runaway_since = now
+        elif now - self._runaway_since >= self.RUNAWAY_TIME:
+            print("[f:%d] ! runaway: pan pinned at %.0f with dx %+.2f, lock id=%s dropped"
+                  % (self.frame_count, sc.pan_angle, dx, self.locked_id), flush=True)
+            self._runaway_since = None
+            self.locked_id = None
+            self.locked_box = None
+            self.locked_abs = None
+            self.lock_lost_frame = None
+            # Look back towards the middle rather than into the stop.
+            sc.search_dir = 1.0 if sc.pan_angle < 0 else -1.0
+
+    def target_velocity(self, frame_w, frame_h):
+        """
+        The locked target's own angular velocity (pan, tilt) in deg/s for the
+        servo lead, or None.
+
+        Only in world coordinates: without camera motion compensation
+        Norfair's velocity contains the camera's own turning, and leading on
+        that would be positive feedback, the rig chasing its own motion.
+        """
+        sc = self.servo_controller
+        if not (self._abs_ok and sc and sc.lead > 0.0 and self._last_tracked):
+            return None
+        obj = self._last_tracked[0]
+        if getattr(obj, "age", 0) < self.VELOCITY_MIN_AGE:
+            return None
+        try:
+            v = np.asarray(obj.estimate_velocity, dtype=float).mean(axis=0)
+        except (AttributeError, ValueError):
+            return None
+        fps = self._fps or sc.ref_fps
+        return (float(v[0]) * fps * (2.0 * sc.half_hfov) / frame_w,
+                float(v[1]) * fps * (2.0 * sc.half_vfov) / frame_h)
+
+    def publish_status(self, img, tracked_objects, now, stats):
+        """Hand the front ends (panel, browser) what they show, once per frame."""
+        if self._fps_time is not None and now > self._fps_time:
+            inst = 1.0 / (now - self._fps_time)
+            self._fps = inst if not self._fps else 0.9 * self._fps + 0.1 * inst
+        self._fps_time = now
+        sc = self.servo_controller
+        locked = None
+        if self.state.startswith("LOCKED") and tracked_objects:
+            locked = tracked_objects[0].id
+        status = {
+            "state": self.state,
+            "locked_id": locked,
+            "tracked": len(self._all_tracked),
+            "fps": round(self._fps, 1),
+            "frame": self.frame_count,
+            "frame_w": int(img.shape[1]),
+            "frame_h": int(img.shape[0]),
+            "servo": bool(sc and sc.enabled),
+            "servo_stopped": self._servo_stopped,
+            "searching": bool(sc and sc.searching),
+            "pan": round(sc.pan_angle, 1) if sc else None,
+            "tilt": round(sc.tilt_angle, 1) if sc else None,
+            "cooldown": round(self.fire.cooldown_left(now), 3),
+        }
+        status.update(stats)
+        self.controls.publish_status(status)
 
     def draw_status_badge(self, frame):
         """
@@ -2103,7 +2428,7 @@ class PostProcessTracking(PostProcess):
         once at startup instead, where it belongs.
         """
         label = self.state
-        if self.ui is not None and self.ui.manual:
+        if self.controls.manual:
             label = "MANUEL | " + label
         if self.servo_controller and self.servo_controller.searching:
             label += " (scan)"
