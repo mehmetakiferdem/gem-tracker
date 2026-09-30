@@ -197,6 +197,7 @@ class EdgeAIDemo:
                     "display_fb",
                     "display_rotate",
                     "display_touch",
+                    "display_perf",
                     "hud_style",
                 ):
                     if key in model_config:

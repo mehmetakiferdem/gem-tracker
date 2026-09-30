@@ -1349,16 +1349,38 @@ class PostProcessTracking(PostProcess):
         self.frame_count = 0
         self._reported_ids = set()
 
-        # Local panel through the framebuffer, see fb_view.py. "" turns it off.
+        # Local panel through KMS (/dev/dri/cardN, every connected display at
+        # its own mode, see kms_view.py) or the framebuffer (/dev/fbN, see
+        # fb_view.py). "" turns it off.
         self.fb_view = None
         fb_dev = str(getattr(self.model, "display_fb", ""))
-        if fb_dev:
+        rotate = int(getattr(self.model, "display_rotate", 90))
+        if fb_dev.startswith("/dev/dri/"):
+            try:
+                from kms_view import KmsView
+
+                self.fb_view = KmsView(device=fb_dev, rotate=rotate)
+            except Exception as exc:
+                print("[WARNING] KMS view failed (%s), falling back to /dev/fb0" % exc)
+                fb_dev = "/dev/fb0"
+        # Frame rate and core loads on the HDMI TV only (not on the panel,
+        # not in the web or RTP streams), see perf_stats.py.
+        self.perf = None
+        if self.fb_view is not None and hasattr(self.fb_view, "overlay") and bool(
+            getattr(self.model, "display_perf", True)
+        ):
+            try:
+                from perf_stats import PerfStats
+
+                self.perf = PerfStats(str(getattr(self.model, "model_name", "")))
+                self.fb_view.overlay = lambda img: self.perf.draw(img, self._fps)
+            except Exception as exc:
+                print("[WARNING] Performance box disabled: %s" % exc)
+        if fb_dev and self.fb_view is None:
             try:
                 from fb_view import FbView
 
-                self.fb_view = FbView(
-                    device=fb_dev, rotate=int(getattr(self.model, "display_rotate", 90))
-                )
+                self.fb_view = FbView(device=fb_dev, rotate=rotate)
             except Exception as exc:
                 print("[WARNING] Panel view disabled: %s" % exc)
 

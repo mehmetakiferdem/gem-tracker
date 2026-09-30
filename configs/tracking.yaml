@@ -147,16 +147,24 @@ models:
         # 0 turns it off. Costs nothing while no browser is open.
         web_view_port: 8080
 
-        # Local panel through the framebuffer. "" turns it off. The Waveshare
-        # 5" DSI LCD here is the 800x480 Raspberry Pi compatible one (overlay
+        # Local panel. "" turns it off. The Waveshare 5" DSI LCD here is the
+        # 800x480 Raspberry Pi compatible one (overlay
         # k3-am67a-t3-gem-o1-dsi-rpi-7inch-panel.dtbo), landscape, so no
         # rotation; the picture is scaled to fit. 90/180/270 for a panel
-        # mounted another way.
-        display_fb: /dev/fb0
+        # mounted another way (the rotation applies to the panel only).
+        # /dev/dri/card0 drives every connected display (DSI + HDMI) at its
+        # own resolution through KMS; /dev/fb0 shares one framebuffer sized
+        # to the largest display, so the panel shows only a corner of it
+        # while a TV is connected.
+        display_fb: /dev/dri/card0
         display_rotate: 0
         # Touchscreen: tap a face to lock onto it, tap elsewhere to release.
         # auto finds the FT5x06 of this panel, "" turns it off.
         display_touch: auto
+        # FPS and the load of each A53 core and C7x DSP, in a box at the top
+        # right of the HDMI TV picture (only with /dev/dri, never on the
+        # panel or the web view). The C7x marked AI runs the detector.
+        display_perf: True
         # Picture style at start: plain | aim | night | thermal (see hud.py).
         # The round buttons on the panel switch it while running.
         hud_style: aim
