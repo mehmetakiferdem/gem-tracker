@@ -8,8 +8,15 @@ source /opt/t3-edgeai-env
 # load; this one ~1 s. Only drawing and JPEG encoding use cv2 here.
 export PYTHONPATH=/opt/tracker-pylibs${PYTHONPATH:+:$PYTHONPATH}
 
+# Kamera takılı değilse ekranda uyarı göster, takılınca devam et
+python3 /home/gemstone/object-tracker-o1/apps_python/camera_wait.py
+
 # Kamerayı tanıt
 bash /opt/edgeai-gst-apps/scripts/setup_cameras.sh
+if [ ! -e /dev/video-imx219-cam0 ]; then
+    echo "[ERROR] /dev/video-imx219-cam0 yok, yeniden denenecek"
+    exit 1
+fi
 
 # Uygulamayı başlat
 cd /home/gemstone/object-tracker-o1/apps_python
